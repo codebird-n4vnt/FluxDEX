@@ -199,7 +199,6 @@ interface ISomniaReactivityPrecompile {
 
 /// @title  FluxVault
 /// @notice Core of FluxDEX — a Just-In-Time Liquidity Rebalancer for a Uniswap V3
-///         USDC/WETH pool on Somnia Testnet.
 /// @dev    Uses Somnia Reactivity to subscribe to the pool's `Swap` event. Whenever
 ///         a swap pushes the tick outside [tickLower, tickUpper], the validator
 ///         invokes `onEvent` in the subsequent block. The vault then:
@@ -257,6 +256,12 @@ contract FluxVault {
     /// @dev Reverts when tick range parameters are invalid (e.g. halfWidth ≤ 0).
     error InvalidTickRange();
 
+    /// @dev Reverts when startBackupWatcher is called while already active.
+    error BackupAlreadyWatching();
+
+    /// @dev Reverts when stopBackupWatcher is called while not active.
+    error BackupNotWatching();
+
     /// @dev Reverts when the vault's STT balance is below the 32 STT minimum.
     /// @param required  Minimum balance needed (32 STT = 32e18 wei).
     /// @param actual    Vault's current STT balance.
@@ -274,6 +279,11 @@ contract FluxVault {
     // ═══════════════════════════════════════════════════════════════════════════
     //  CONSTANTS
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice How many blocks between each BlockTick backup check.
+    /// @dev    50 blocks = ~5 seconds on Somnia (10 blocks/sec).
+    ///         Reduces STT drain from BlockTick firing every single block.
+    uint256 public constant BACKUP_CHECK_INTERVAL = 50;
 
     /// @notice keccak256("BlockTick(uint64)") — Somnia system event topic.
     bytes32 public constant BLOCK_TICK_TOPIC = keccak256("BlockTick(uint64)");
@@ -295,13 +305,11 @@ contract FluxVault {
     bytes32 public constant SWAP_TOPIC =
         0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67;
 
-    /// @notice USDC token address on Somnia Testnet.
-    /// @dev    token0 (0x28... < 0x93..., so USDC is always token0 in this pair).
-    address public constant USDC = 0x28bec7e30e6faee657a03e19bf1128aad7632a00;
+    /// @notice token0 of the managed pool (lower address of the pair).
+    address public immutable token0;
 
-    /// @notice WETH token address on Somnia Testnet.
-    /// @dev    token1.
-    address public constant WETH = 0x936Ab8C674bcb567CD5dEB85D8A216494704E9D8;
+    /// @notice token1 of the managed pool (higher address of the pair).
+    address public immutable token1;
 
     /// @notice Minimum STT balance the vault must hold for a live Reactivity sub.
     uint256 public constant MIN_STT_BALANCE = 32 ether; // 32 STT (18 decimals)
@@ -346,7 +354,7 @@ contract FluxVault {
     address public owner;
 
     // ── Slot 1 ──────────────────────────────────────────────────────────────
-    /// @notice The Uniswap V3 USDC/WETH pool being managed.
+    /// @notice The Uniswap V3 pool being managed.
     address public pool;
 
     // ── Slot 2 ──────────────────────────────────────────────────────────────
@@ -362,12 +370,20 @@ contract FluxVault {
     uint256 public subscriptionId;
 
     // ── Slot 5 ──────────────────────────────────────────────────────────────
+    /// @notice Reactivity subscription ID for the BlockTick backup watcher (0 = none).
+    uint256 public backupSubscriptionId;
+
+    // ── Slot 6 ──────────────────────────────────────────────────────────────
+    /// @notice Last block number at which the backup watcher ran its range check.
+    uint256 public lastBackupCheckBlock;
+
+    // ── Slot 7 ──────────────────────────────────────────────────────────────
     /// @notice Reentrancy lock. 1 = unlocked, 2 = locked.
     /// @dev    Initialized to 1 (not 0) so the first lock costs a warm SSTORE
     ///         (~100 gas) instead of a cold new slot write (~200,100 gas on Somnia).
     uint256 private _locked;
 
-    // ── Slot 6 ──────────────────────────────────────────────────────────────
+    // ── Slot 8 ──────────────────────────────────────────────────────────────
     /// @notice All packed mutable vault config in a single storage slot.
     VaultConfig public config;
 
@@ -438,7 +454,7 @@ contract FluxVault {
     /// @dev    Does NOT mint a position or start watching — call the two-step setup:
     ///         1. `initializeFirstPosition(…)`
     ///         2. Fund with ≥ 32 STT, then `startWatching(gasLimit)`
-    /// @param _pool        Address of the Uniswap V3 USDC/WETH pool.
+    /// @param _pool        Address of the Uniswap V3 pool.
     /// @param _npm         Address of the NonfungiblePositionManager.
     /// @param _halfWidth   Half of the desired tick range (e.g. 600 = ±600 ticks).
     ///                     Must be a positive multiple of `_tickSpacing`.
@@ -447,7 +463,9 @@ contract FluxVault {
         address _pool,
         address _npm,
         int24 _halfWidth,
-        int24 _tickSpacing
+        int24 _tickSpacing,
+        address _token0,
+        address _token1
     ) {
         if (_pool == address(0) || _npm == address(0)) revert ZeroAddress();
         if (_halfWidth <= 0 || _tickSpacing <= 0) revert InvalidTickRange();
@@ -491,13 +509,13 @@ contract FluxVault {
 
     /// @notice Mints the vault's first LP position, centered on the pool's current tick.
     /// @dev    Must be called by the owner before `startWatching`.
-    ///         The owner must first transfer sufficient USDC and WETH to this contract.
+
     ///         Token approvals to the NPM are set to `type(uint256).max` here and are
     ///         never revoked — safe because the vault itself holds the tokens.
-    /// @param amount0Desired  Desired USDC amount to deposit.
-    /// @param amount1Desired  Desired WETH amount to deposit.
-    /// @param amount0Min      Minimum USDC (slippage guard; 0 is fine for testnet).
-    /// @param amount1Min      Minimum WETH (slippage guard; 0 is fine for testnet).
+    /// @param amount0Desired  Desired token0 amount to deposit.
+    /// @param amount1Desired  Desired token1 amount to deposit.
+    /// @param amount0Min      Minimum token0 (slippage guard; 0 is fine for testnet).
+    /// @param amount1Min      Minimum token1 (slippage guard; 0 is fine for testnet).
     function initializeFirstPosition(
         uint256 amount0Desired,
         uint256 amount1Desired,
@@ -525,14 +543,14 @@ contract FluxVault {
         );
 
         // ── Approve NPM once (max allowance) ─────────────────────────────────
-        IERC20(USDC).approve(_npm, type(uint256).max);
-        IERC20(WETH).approve(_npm, type(uint256).max);
+        IERC20(token0).approve(_npm, type(uint256).max);
+        IERC20(token1).approve(_npm, type(uint256).max);
 
         // ── Mint the initial position ─────────────────────────────────────────
         (uint256 _tokenId, , , ) = INonfungiblePositionManager(_npm).mint(
             INonfungiblePositionManager.MintParams({
-                token0: USDC,
-                token1: WETH,
+                token0: token0,
+                token1: token1,
                 fee: cfg.poolFee,
                 tickLower: _tickLower,
                 tickUpper: _tickUpper,
@@ -610,6 +628,45 @@ contract FluxVault {
         emit WatchingStarted(subId);
     }
 
+    /// @notice Registers a BlockTick Reactivity subscription as a backup rebalance trigger.
+    /// @dev    Fires every block. Reads current tick from slot0() and rebalances if
+    ///         the position is out of range. Supplements the Swap subscription — does
+    ///         not replace it. Requires vault to hold >= 32 STT (shared with primary sub).
+    /// @param  gasLimit  Max gas per invocation. Recommended: 2_000_000 (lighter than
+    ///                   Swap handler since it often returns early on the range check).
+    function startBackupWatcher(uint64 gasLimit) external onlyOwner {
+        VaultConfig memory cfg = config;
+
+        if (!cfg.initialized) revert NotInitialized();
+        if (backupSubscriptionId != 0) revert BackupAlreadyWatching();
+
+        uint256 balance = address(this).balance;
+        if (balance < MIN_STT_BALANCE)
+            revert InsufficientSTTBalance(MIN_STT_BALANCE, balance);
+
+        bytes32[4] memory topics;
+        topics[0] = BLOCK_TICK_TOPIC;
+
+        SubscriptionData memory subData = SubscriptionData({
+            eventTopics: topics,
+            origin: address(0),
+            caller: address(0),
+            emitter: address(PRECOMPILE), // ← system event emitter
+            handlerContractAddress: address(this),
+            handlerFunctionSelector: this.onEvent.selector,
+            priorityFeePerGas: PRIORITY_FEE_PER_GAS,
+            maxFeePerGas: MAX_FEE_PER_GAS,
+            gasLimit: gasLimit,
+            isGuaranteed: true,
+            isCoalesced: false
+        });
+
+        uint256 subId = PRECOMPILE.subscribe(subData);
+        backupSubscriptionId = subId;
+
+        emit WatchingStarted(subId);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  PHASE 2B — REACTIVITY CALLBACK
     // ═══════════════════════════════════════════════════════════════════════════
@@ -633,28 +690,29 @@ contract FluxVault {
         bytes32[] calldata eventTopics,
         bytes calldata data
     ) external onlyPrecompile nonReentrant {
-        // Silence unused-variable warnings — we rely on subscription-level filtering.
-        emitter;
-        eventTopics;
-
-        // ── Cache config slot (single cold SLOAD) ────────────────────────────
         VaultConfig memory cfg = config;
 
-        // ── Decode the new tick from Swap event data ──────────────────────────
-        // Swap(address sender, address recipient, int256 amount0, int256 amount1,
-        //      uint160 sqrtPriceX96, uint128 liquidity, int24 tick)
-        // `sender` and `recipient` are indexed, so `data` only contains the last 5 fields.
-        (, , , , int24 newTick) = abi.decode(
-            data,
-            (int256, int256, uint160, uint128, int24)
-        );
+        if (emitter == pool) {
+            // ── Path A: Swap event from pool ──────────────────────────────────
+            (, , , , int24 newTick) = abi.decode(
+                data,
+                (int256, int256, uint160, uint128, int24)
+            );
+            if (newTick >= cfg.tickLower && newTick < cfg.tickUpper) return;
+            _rebalance(newTick, cfg);
+        } else if (emitter == address(PRECOMPILE)) {
+            // ── Path B: BlockTick system event — backup rebalance check ───────
+            // Interval guard — only run the check every BACKUP_CHECK_INTERVAL blocks.
+            // Prevents STT drain from validator gas fees on every single block.
+            uint256 lastCheck = lastBackupCheckBlock; // 1 cold SLOAD
+            if (block.number - lastCheck < BACKUP_CHECK_INTERVAL) return;
+            lastBackupCheckBlock = block.number; // 1 SSTORE
 
-        // ── Guard: skip if tick is still inside the current range ─────────────
-        // tickUpper is exclusive in Uniswap V3 (active range: tickLower ≤ tick < tickUpper)
-        if (newTick >= cfg.tickLower && newTick < cfg.tickUpper) return;
-
-        // ── Rebalance ─────────────────────────────────────────────────────────
-        _rebalance(newTick, cfg);
+            (, int24 currentTick, , , , , ) = IUniswapV3Pool(pool).slot0();
+            if (currentTick >= cfg.tickLower && currentTick < cfg.tickUpper)
+                return;
+            _rebalance(currentTick, cfg);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -732,13 +790,13 @@ contract FluxVault {
 
         // ── 6. Mint fresh position with vault's entire token balance ──────────
         // Using full balance maximises capital efficiency post-rebalance.
-        uint256 bal0 = IERC20(USDC).balanceOf(address(this));
-        uint256 bal1 = IERC20(WETH).balanceOf(address(this));
+        uint256 bal0 = IERC20(token0).balanceOf(address(this));
+        uint256 bal1 = IERC20(token1).balanceOf(address(this));
 
         (uint256 newTokenId, , , ) = INonfungiblePositionManager(_npm).mint(
             INonfungiblePositionManager.MintParams({
-                token0: USDC,
-                token1: WETH,
+                token0: token0,
+                token1: token1,
                 fee: cfg.poolFee,
                 tickLower: newTickLower,
                 tickUpper: newTickUpper,
@@ -802,6 +860,18 @@ contract FluxVault {
         emit WatchingStopped(subId);
     }
 
+    /// @notice Cancels the BlockTick backup subscription.
+    function stopBackupWatcher() external onlyOwner nonReentrant {
+        uint256 subId = backupSubscriptionId;
+        if (subId == 0) revert BackupNotWatching();
+
+        PRECOMPILE.unsubscribe(subId);
+
+        backupSubscriptionId = 0;
+
+        emit WatchingStopped(subId);
+    }
+
     /// @notice Updates the half-width of the rebalance range for future positions.
     /// @dev    Takes effect on the next rebalance; does NOT move the current position.
     /// @param  _halfWidth  New half-width in ticks. Must be a positive multiple of tickSpacing.
@@ -820,7 +890,6 @@ contract FluxVault {
     }
 
     /// @notice Rescue ERC-20 tokens held by the vault.
-    /// @dev    Intended for recovering USDC/WETH surplus or any accidental sends.
     /// @param  token   ERC-20 token address.
     /// @param  amount  Amount to transfer to the owner.
     function rescueTokens(address token, uint256 amount) external onlyOwner {
