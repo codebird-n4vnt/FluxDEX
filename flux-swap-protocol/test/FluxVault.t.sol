@@ -31,7 +31,7 @@ pragma solidity 0.8.19;
 // ════════════════════════════════════════════════════════════════════════════════
 
 import {Test, console2} from "forge-std/Test.sol";
-import {FluxVault}      from "../src/FluxVault.sol";
+import {FluxVault} from "../src/FluxVault.sol";
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  MOCK — ERC-20
@@ -39,7 +39,7 @@ import {FluxVault}      from "../src/FluxVault.sol";
 //  Etched at USDC_ADDR and WETH_ADDR via vm.etch().
 // ──────────────────────────────────────────────────────────────────────────────
 contract MockERC20 {
-    mapping(address => uint256)                     public balanceOf;
+    mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
     function mint(address to, uint256 amount) external {
@@ -53,14 +53,18 @@ contract MockERC20 {
 
     function transfer(address to, uint256 amount) external returns (bool) {
         balanceOf[msg.sender] -= amount;
-        balanceOf[to]         += amount;
+        balanceOf[to] += amount;
         return true;
     }
 
-    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool) {
         allowance[from][msg.sender] -= amount;
-        balanceOf[from]             -= amount;
-        balanceOf[to]               += amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
         return true;
     }
 }
@@ -70,13 +74,17 @@ contract MockERC20 {
 //  Configurable tick, TWAP, and observe() revert flag.
 // ──────────────────────────────────────────────────────────────────────────────
 contract MockPool {
-    int24  public currentTick;
-    bool   public twapShouldRevert;
-    int56  public twapCumulative0;
-    int56  public twapCumulative1;
+    int24 public currentTick;
+    bool public twapShouldRevert;
+    int56 public twapCumulative0;
+    int56 public twapCumulative1;
 
-    function setCurrentTick(int24 t)          external { currentTick      = t; }
-    function setTwapShouldRevert(bool v)       external { twapShouldRevert = v; }
+    function setCurrentTick(int24 t) external {
+        currentTick = t;
+    }
+    function setTwapShouldRevert(bool v) external {
+        twapShouldRevert = v;
+    }
 
     /// @dev Sets cumulatives so computed TWAP = twapTick over 300s window.
     function setTwapTick(int24 twapTick) external {
@@ -84,22 +92,34 @@ contract MockPool {
         twapCumulative1 = int56(twapTick) * 300;
     }
 
-    function slot0() external view returns (
-        uint160, int24, uint16, uint16, uint16, uint8, bool
-    ) {
+    function slot0()
+        external
+        view
+        returns (uint160, int24, uint16, uint16, uint16, uint8, bool)
+    {
         return (0, currentTick, 0, 0, 0, 0, true);
     }
 
-    function fee() external pure returns (uint24) { return 3000; }
+    function fee() external pure returns (uint24) {
+        return 3000;
+    }
 
-    function tickSpacing() external pure returns (int24) { return 60; }
+    function tickSpacing() external pure returns (int24) {
+        return 60;
+    }
 
-    function observe(uint32[] calldata) external view returns (
-        int56[] memory tickCumulatives,
-        uint160[] memory secondsPerLiquidityCumulativeX128s
-    ) {
+    function observe(
+        uint32[] calldata
+    )
+        external
+        view
+        returns (
+            int56[] memory tickCumulatives,
+            uint160[] memory secondsPerLiquidityCumulativeX128s
+        )
+    {
         require(!twapShouldRevert, "MockPool: observe forced revert");
-        tickCumulatives    = new int56[](2);
+        tickCumulatives = new int56[](2);
         tickCumulatives[0] = twapCumulative0;
         tickCumulatives[1] = twapCumulative1;
         secondsPerLiquidityCumulativeX128s = new uint160[](2);
@@ -116,69 +136,115 @@ contract MockNPM {
     uint256 public decreaseLiquidityCallCount;
     uint256 public collectCallCount;
 
-    int24   public lastMintTickLower;
-    int24   public lastMintTickUpper;
+    int24 public lastMintTickLower;
+    int24 public lastMintTickUpper;
     uint256 public lastBurnTokenId;
 
-    uint256 public nextTokenId       = 1;
+    uint256 public nextTokenId = 1;
     uint128 public positionLiquidity = 1_000_000;
 
     struct MintParams {
-        address token0; address token1; uint24 fee;
-        int24 tickLower; int24 tickUpper;
-        uint256 amount0Desired; uint256 amount1Desired;
-        uint256 amount0Min;     uint256 amount1Min;
-        address recipient;      uint256 deadline;
+        address token0;
+        address token1;
+        uint24 fee;
+        int24 tickLower;
+        int24 tickUpper;
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        uint256 amount0Min;
+        uint256 amount1Min;
+        address recipient;
+        uint256 deadline;
     }
 
     struct DecreaseLiquidityParams {
-        uint256 tokenId; uint128 liquidity;
-        uint256 amount0Min; uint256 amount1Min; uint256 deadline;
+        uint256 tokenId;
+        uint128 liquidity;
+        uint256 amount0Min;
+        uint256 amount1Min;
+        uint256 deadline;
     }
 
     struct CollectParams {
-        uint256 tokenId; address recipient;
-        uint128 amount0Max; uint128 amount1Max;
+        uint256 tokenId;
+        address recipient;
+        uint128 amount0Max;
+        uint128 amount1Max;
     }
 
-    function mint(MintParams calldata p)
+    function mint(
+        MintParams calldata p
+    )
         external
         returns (uint256 tokenId, uint128 liquidity, uint256 a0, uint256 a1)
     {
         mintCallCount++;
         lastMintTickLower = p.tickLower;
         lastMintTickUpper = p.tickUpper;
-        tokenId   = nextTokenId++;
+        tokenId = nextTokenId++;
         liquidity = 500_000;
         a0 = p.amount0Desired / 2;
         a1 = p.amount1Desired / 2;
 
         // Simulate ERC-721 safeTransferFrom → vault.onERC721Received()
-        (bool ok,) = p.recipient.call(
+        (bool ok, ) = p.recipient.call(
             abi.encodeWithSignature(
                 "onERC721Received(address,address,uint256,bytes)",
-                address(this), address(0), tokenId, ""
+                address(this),
+                address(0),
+                tokenId,
+                ""
             )
         );
         require(ok, "MockNPM: onERC721Received failed");
     }
 
-    function positions(uint256) external view returns (
-        uint96, address, address, address, uint24,
-        int24, int24, uint128, uint256, uint256, uint128, uint128
-    ) {
-        return (0, address(0), address(0), address(0), 3000,
-                -600, 600, positionLiquidity, 0, 0, 0, 0);
+    function positions(
+        uint256
+    )
+        external
+        view
+        returns (
+            uint96,
+            address,
+            address,
+            address,
+            uint24,
+            int24,
+            int24,
+            uint128,
+            uint256,
+            uint256,
+            uint128,
+            uint128
+        )
+    {
+        return (
+            0,
+            address(0),
+            address(0),
+            address(0),
+            3000,
+            -600,
+            600,
+            positionLiquidity,
+            0,
+            0,
+            0,
+            0
+        );
     }
 
-    function decreaseLiquidity(DecreaseLiquidityParams calldata)
-        external returns (uint256, uint256)
-    {
+    function decreaseLiquidity(
+        DecreaseLiquidityParams calldata
+    ) external returns (uint256, uint256) {
         decreaseLiquidityCallCount++;
         return (0, 0);
     }
 
-    function collect(CollectParams calldata) external returns (uint256, uint256) {
+    function collect(
+        CollectParams calldata
+    ) external returns (uint256, uint256) {
         collectCallCount++;
         return (100e6, 0.05 ether);
     }
@@ -188,8 +254,12 @@ contract MockNPM {
         lastBurnTokenId = tokenId_;
     }
 
-    function setPositionLiquidity(uint128 liq) external { positionLiquidity = liq; }
-    function setNextTokenId(uint256 id)         external { nextTokenId        = id; }
+    function setPositionLiquidity(uint128 liq) external {
+        positionLiquidity = liq;
+    }
+    function setNextTokenId(uint256 id) external {
+        nextTokenId = id;
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -198,21 +268,28 @@ contract MockNPM {
 //  Returns incrementing subscription IDs.
 // ──────────────────────────────────────────────────────────────────────────────
 contract MockPrecompile {
-    uint256 public nextSubId            = 1001;
+    uint256 public nextSubId = 1001;
     uint256 public unsubscribeCallCount;
     uint256 public lastUnsubscribedId;
 
     // SubscriptionData must match the struct layout in FluxVault exactly.
     struct SubscriptionData {
         bytes32[4] eventTopics;
-        address origin; address caller; address emitter;
+        address origin;
+        address caller;
+        address emitter;
         address handlerContractAddress;
-        bytes4  handlerFunctionSelector;
-        uint64  priorityFeePerGas; uint64 maxFeePerGas; uint64 gasLimit;
-        bool isGuaranteed; bool isCoalesced;
+        bytes4 handlerFunctionSelector;
+        uint64 priorityFeePerGas;
+        uint64 maxFeePerGas;
+        uint64 gasLimit;
+        bool isGuaranteed;
+        bool isCoalesced;
     }
 
-    function subscribe(SubscriptionData calldata) external returns (uint256 subId) {
+    function subscribe(
+        SubscriptionData calldata
+    ) external returns (uint256 subId) {
         subId = nextSubId++;
     }
 
@@ -221,44 +298,42 @@ contract MockPrecompile {
         lastUnsubscribedId = subId;
     }
 
-    function getSubscriptionInfo(uint256) external pure
-        returns (SubscriptionData memory d, address owner)
-    {
+    function getSubscriptionInfo(
+        uint256
+    ) external pure returns (SubscriptionData memory d, address owner) {
         return (d, address(0));
     }
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  FLUXVAULT TEST SUITE
 // ──────────────────────────────────────────────────────────────────────────────
 contract FluxVaultTest is Test {
-
     // ── Fixed addresses (match FluxVault constants) ───────────────────────────
-    address constant PRECOMPILE_ADDR = 0x0000000000000000000000000000000000000100;
-    address constant USDC_ADDR       = 0x28bec7e30e6faee657a03e19bf1128aad7632a00;
-    address constant WETH_ADDR       = 0x936Ab8C674bcb567CD5dEB85D8A216494704E9D8;
+    address constant PRECOMPILE_ADDR =
+        0x0000000000000000000000000000000000000100;
+    address constant TOKEN0_ADDR = 0x96Eb871D51C51Af3BdEF5A5bf96a75812f220b68;
+    address constant TOKEN1_ADDR = 0x936Ab8C674bcb567CD5dEB85D8A216494704E9D8;
 
     // ── Actors ────────────────────────────────────────────────────────────────
-    address owner    = makeAddr("owner");
+    address owner = makeAddr("owner");
     address attacker = makeAddr("attacker");
     address stranger = makeAddr("stranger");
 
     // ── Mocks ─────────────────────────────────────────────────────────────────
-    MockERC20      usdc;
-    MockERC20      weth;
-    MockPool       pool;
-    MockNPM        npm;
+    MockERC20 token0;
+    MockERC20 token1;
+    MockPool pool;
+    MockNPM npm;
     MockPrecompile precompile;
 
     // ── Subject ───────────────────────────────────────────────────────────────
     FluxVault vault;
 
     // ── Parameters ───────────────────────────────────────────────────────────
-    int24   constant HALF_WIDTH   = 600;
-    int24   constant TICK_SPACING = 60;
-    uint256 constant STT_FUNDING  = 40 ether;
-
+    int24 constant HALF_WIDTH = 600;
+    int24 constant TICK_SPACING = 60;
+    uint256 constant STT_FUNDING = 40 ether;
 
     // ─────────────────────────────────────────────────────────────────────────
     //  SET UP
@@ -266,18 +341,17 @@ contract FluxVaultTest is Test {
 
     function setUp() public {
         // 1. Deploy mocks to temporary addresses
-        pool       = new MockPool();
-        npm        = new MockNPM();
+        pool = new MockPool();
+        npm = new MockNPM();
         precompile = new MockPrecompile();
 
         // 2. Etch mocks at the constant addresses the vault hardcodes
         vm.etch(PRECOMPILE_ADDR, address(precompile).code);
-        vm.etch(USDC_ADDR,       address(new MockERC20()).code);
-        vm.etch(WETH_ADDR,       address(new MockERC20()).code);
+        vm.etch(TOKEN0_ADDR, address(new MockERC20()).code);
+        vm.etch(TOKEN1_ADDR, address(new MockERC20()).code);
 
-        // 3. Get typed handles to the etched addresses
-        usdc = MockERC20(USDC_ADDR);
-        weth = MockERC20(WETH_ADDR);
+        token0 = MockERC20(TOKEN0_ADDR);
+        token1 = MockERC20(TOKEN1_ADDR);
 
         // 4. Configure pool defaults: tick=0, TWAP=0 (no manipulation)
         pool.setCurrentTick(0);
@@ -285,16 +359,15 @@ contract FluxVaultTest is Test {
 
         // 5. Deploy vault as owner
         vm.prank(owner);
-        vault = new FluxVault(address(pool), address(npm), HALF_WIDTH, TICK_SPACING);
+        vault = new FluxVault(address(pool), address(npm), HALF_WIDTH, TICK_SPACING, TOKEN0_ADDR, TOKEN1_ADDR);
 
         // 6. Fund vault with STT for Reactivity subscription
         vm.deal(address(vault), STT_FUNDING);
 
         // 7. Seed vault with tokens for LP positions
-        usdc.mint(address(vault), 1_000e6);
-        weth.mint(address(vault), 1 ether);
+        token0.mint(address(vault), 1_000e6);
+        token1.mint(address(vault), 1 ether);
     }
-
 
     // ═════════════════════════════════════════════════════════════════════════
     //  CONSTRUCTOR
@@ -313,13 +386,20 @@ contract FluxVaultTest is Test {
     }
 
     function test_Constructor_ConfigPackedCorrectly() public {
-        (int24 tl, int24 tu, int24 hw, int24 ts, uint24 fee, bool init, bool watching)
-            = vault.config();
-        assertEq(tl,    0);
-        assertEq(tu,    0);
-        assertEq(hw,    HALF_WIDTH);
-        assertEq(ts,    TICK_SPACING);
-        assertEq(fee,   3000);
+        (
+            int24 tl,
+            int24 tu,
+            int24 hw,
+            int24 ts,
+            uint24 fee,
+            bool init,
+            bool watching
+        ) = vault.config();
+        assertEq(tl, 0);
+        assertEq(tu, 0);
+        assertEq(hw, HALF_WIDTH);
+        assertEq(ts, TICK_SPACING);
+        assertEq(fee, 3000);
         assertFalse(init);
         assertFalse(watching);
     }
@@ -332,24 +412,23 @@ contract FluxVaultTest is Test {
 
     function test_Constructor_RevertZeroPool() public {
         vm.expectRevert(FluxVault.ZeroAddress.selector);
-        new FluxVault(address(0), address(npm), HALF_WIDTH, TICK_SPACING);
+        new FluxVault(address(0), address(npm), HALF_WIDTH, TICK_SPACING, TOKEN0_ADDR, TOKEN1_ADDR);
     }
 
     function test_Constructor_RevertZeroNpm() public {
         vm.expectRevert(FluxVault.ZeroAddress.selector);
-        new FluxVault(address(pool), address(0), HALF_WIDTH, TICK_SPACING);
+        new FluxVault(address(pool), address(0), HALF_WIDTH, TICK_SPACING, TOKEN0_ADDR, TOKEN1_ADDR);
     }
 
     function test_Constructor_RevertZeroHalfWidth() public {
         vm.expectRevert(FluxVault.InvalidTickRange.selector);
-        new FluxVault(address(pool), address(npm), 0, TICK_SPACING);
+        new FluxVault(address(pool), address(npm), 0, TICK_SPACING, TOKEN0_ADDR, TOKEN1_ADDR);
     }
 
     function test_Constructor_RevertNegativeHalfWidth() public {
         vm.expectRevert(FluxVault.InvalidTickRange.selector);
-        new FluxVault(address(pool), address(npm), -600, TICK_SPACING);
+        new FluxVault(address(pool), address(npm), -600, TICK_SPACING, TOKEN0_ADDR, TOKEN1_ADDR);
     }
-
 
     // ═════════════════════════════════════════════════════════════════════════
     //  onERC721Received
@@ -367,7 +446,6 @@ contract FluxVaultTest is Test {
         assertEq(result, vault.onERC721Received.selector);
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  initializeFirstPosition
     // ═════════════════════════════════════════════════════════════════════════
@@ -381,7 +459,7 @@ contract FluxVaultTest is Test {
     function test_InitFirstPosition_SetsInitialized() public {
         vm.prank(owner);
         vault.initializeFirstPosition(1_000e6, 1 ether, 0, 0);
-        (,,,,, bool init,) = vault.config();
+        (, , , , , bool init, ) = vault.config();
         assertTrue(init);
     }
 
@@ -391,20 +469,20 @@ contract FluxVaultTest is Test {
         // upper = roundUp(0+600, 60)   =  600
         vm.prank(owner);
         vault.initializeFirstPosition(1_000e6, 1 ether, 0, 0);
-        (int24 tl, int24 tu,,,,,) = vault.config();
+        (int24 tl, int24 tu, , , , , ) = vault.config();
         assertEq(tl, -600);
-        assertEq(tu,  600);
+        assertEq(tu, 600);
     }
 
     function test_InitFirstPosition_TickRange_PositiveTick() public {
         pool.setCurrentTick(300);
         vm.prank(owner);
         vault.initializeFirstPosition(1_000e6, 1 ether, 0, 0);
-        (int24 tl, int24 tu,,,,,) = vault.config();
+        (int24 tl, int24 tu, , , , , ) = vault.config();
         // lower = roundDown(300-600=-300, 60) = -300
         // upper = roundUp(300+600=900, 60)    =  900
         assertEq(tl, -300);
-        assertEq(tu,  900);
+        assertEq(tu, 900);
     }
 
     function test_InitFirstPosition_TickRange_NegativeTick() public {
@@ -412,11 +490,11 @@ contract FluxVaultTest is Test {
         pool.setCurrentTick(-100);
         vm.prank(owner);
         vault.initializeFirstPosition(1_000e6, 1 ether, 0, 0);
-        (int24 tl, int24 tu,,,,,) = vault.config();
+        (int24 tl, int24 tu, , , , , ) = vault.config();
         // lower = roundDown(-700, 60): -700/60 = -11.67 → compressed=-11 → -1 = -12 → -720
         // upper = roundUp(500, 60):    500/60  =  8.33  → roundDown=480 → +60 = 540
         assertEq(tl, -720);
-        assertEq(tu,  540);
+        assertEq(tu, 540);
     }
 
     function test_InitFirstPosition_EmitsEvent() public {
@@ -440,7 +518,6 @@ contract FluxVaultTest is Test {
         vm.stopPrank();
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  startWatching
     // ═════════════════════════════════════════════════════════════════════════
@@ -452,7 +529,7 @@ contract FluxVaultTest is Test {
 
     function test_StartWatching_SetsWatchingTrue() public {
         _initAndWatch();
-        (,,,,,, bool watching) = vault.config();
+        (, , , , , , bool watching) = vault.config();
         assertTrue(watching);
     }
 
@@ -501,7 +578,6 @@ contract FluxVaultTest is Test {
         vault.startWatching(3_000_000);
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  stopWatching
     // ═════════════════════════════════════════════════════════════════════════
@@ -517,7 +593,7 @@ contract FluxVaultTest is Test {
         _initAndWatch();
         vm.prank(owner);
         vault.stopWatching();
-        (,,,,,, bool watching) = vault.config();
+        (, , , , , , bool watching) = vault.config();
         assertFalse(watching);
     }
 
@@ -527,7 +603,7 @@ contract FluxVaultTest is Test {
         vault.stopWatching();
         MockPrecompile mp = MockPrecompile(PRECOMPILE_ADDR);
         assertEq(mp.unsubscribeCallCount(), 1);
-        assertEq(mp.lastUnsubscribedId(),   1001);
+        assertEq(mp.lastUnsubscribedId(), 1001);
     }
 
     function test_StopWatching_RevertNotWatching() public {
@@ -542,7 +618,6 @@ contract FluxVaultTest is Test {
         vm.expectRevert(FluxVault.NotOwner.selector);
         vault.stopWatching();
     }
-
 
     // ═════════════════════════════════════════════════════════════════════════
     //  onEvent — ACCESS CONTROL
@@ -561,7 +636,6 @@ contract FluxVaultTest is Test {
         vm.expectRevert(FluxVault.NotPrecompile.selector);
         vault.onEvent(address(pool), new bytes32[](0), _swapData(5000));
     }
-
 
     // ═════════════════════════════════════════════════════════════════════════
     //  onEvent — SWAP PATH — IN RANGE
@@ -589,7 +663,6 @@ contract FluxVaultTest is Test {
         vault.onEvent(address(pool), new bytes32[](0), _swapData(599));
         assertEq(npm.mintCallCount(), 1);
     }
-
 
     // ═════════════════════════════════════════════════════════════════════════
     //  onEvent — SWAP PATH — OUT OF RANGE (triggers rebalance)
@@ -623,12 +696,14 @@ contract FluxVaultTest is Test {
         assertEq(npm.mintCallCount(), 2);
     }
 
-    function test_OnEvent_Swap_Rebalance_NewTickRangeCenteredOnNewTick() public {
+    function test_OnEvent_Swap_Rebalance_NewTickRangeCenteredOnNewTick()
+        public
+    {
         _initAndWatch();
         pool.setTwapTick(1200);
         vm.prank(PRECOMPILE_ADDR);
         vault.onEvent(address(pool), new bytes32[](0), _swapData(1200));
-        (int24 tl, int24 tu,,,,,) = vault.config();
+        (int24 tl, int24 tu, , , , , ) = vault.config();
         // lower = roundDown(1200-600=600, 60) = 600
         // upper = roundUp(1200+600=1800, 60)  = 1800
         assertEq(tl, 600);
@@ -660,11 +735,13 @@ contract FluxVaultTest is Test {
         vm.prank(PRECOMPILE_ADDR);
         vault.onEvent(address(pool), new bytes32[](0), _swapData(5000));
         assertEq(npm.decreaseLiquidityCallCount(), 1);
-        assertEq(npm.collectCallCount(),           1);
-        assertEq(npm.burnCallCount(),              1);
+        assertEq(npm.collectCallCount(), 1);
+        assertEq(npm.burnCallCount(), 1);
     }
 
-    function test_OnEvent_Swap_Rebalance_SkipsDecrease_WhenPositionEmpty() public {
+    function test_OnEvent_Swap_Rebalance_SkipsDecrease_WhenPositionEmpty()
+        public
+    {
         _initAndWatch();
         npm.setPositionLiquidity(0); // simulate already drained position
         pool.setTwapTick(5000);
@@ -672,8 +749,8 @@ contract FluxVaultTest is Test {
         vault.onEvent(address(pool), new bytes32[](0), _swapData(5000));
         // decreaseLiquidity guarded by `if (liquidity > 0)`
         assertEq(npm.decreaseLiquidityCallCount(), 0);
-        assertEq(npm.collectCallCount(),           1);
-        assertEq(npm.burnCallCount(),              1);
+        assertEq(npm.collectCallCount(), 1);
+        assertEq(npm.burnCallCount(), 1);
     }
 
     function test_OnEvent_Swap_MultipleRebalances_InSequence() public {
@@ -692,7 +769,6 @@ contract FluxVaultTest is Test {
         assertEq(npm.mintCallCount(), 3);
         assertEq(npm.burnCallCount(), 2);
     }
-
 
     // ═════════════════════════════════════════════════════════════════════════
     //  onEvent — BLOCKTICK PATH
@@ -763,7 +839,6 @@ contract FluxVaultTest is Test {
         assertEq(npm.mintCallCount(), 2); // no additional rebalance
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  TWAP GUARD
     // ═════════════════════════════════════════════════════════════════════════
@@ -822,7 +897,6 @@ contract FluxVaultTest is Test {
         assertEq(npm.mintCallCount(), 1);
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  ADMIN — setHalfWidth
     // ═════════════════════════════════════════════════════════════════════════
@@ -830,7 +904,7 @@ contract FluxVaultTest is Test {
     function test_SetHalfWidth_UpdatesConfig() public {
         vm.prank(owner);
         vault.setHalfWidth(1200);
-        (,, int24 hw,,,,) = vault.config();
+        (, , int24 hw, , , , ) = vault.config();
         assertEq(hw, 1200);
     }
 
@@ -841,7 +915,7 @@ contract FluxVaultTest is Test {
         pool.setTwapTick(5000);
         vm.prank(PRECOMPILE_ADDR);
         vault.onEvent(address(pool), new bytes32[](0), _swapData(5000));
-        (int24 tl, int24 tu,,,,,) = vault.config();
+        (int24 tl, int24 tu, , , , , ) = vault.config();
         // lower = roundDown(5000-1200=3800, 60) = 3780
         // upper = roundUp(5000+1200=6200, 60): 6200/60=103.3 → 103*60=6180 → +60=6240
         assertEq(tl, 3780);
@@ -866,7 +940,6 @@ contract FluxVaultTest is Test {
         vault.setHalfWidth(-600);
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  ADMIN — withdrawSTT
     // ═════════════════════════════════════════════════════════════════════════
@@ -890,29 +963,27 @@ contract FluxVaultTest is Test {
         vault.withdrawSTT(10 ether);
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  ADMIN — rescueTokens
     // ═════════════════════════════════════════════════════════════════════════
 
-    function test_RescueTokens_USDC_TransfersToOwner() public {
-        vm.prank(owner);
-        vault.rescueTokens(USDC_ADDR, 500e6);
-        assertEq(usdc.balanceOf(owner), 500e6);
-    }
+    function test_RescueTokens_Token0_TransfersToOwner() public {
+    vm.prank(owner);
+    vault.rescueTokens(TOKEN0_ADDR, 500e6);
+    assertEq(token0.balanceOf(owner), 500e6);
+}
 
-    function test_RescueTokens_WETH_TransfersToOwner() public {
-        vm.prank(owner);
-        vault.rescueTokens(WETH_ADDR, 0.5 ether);
-        assertEq(weth.balanceOf(owner), 0.5 ether);
-    }
+    function test_RescueTokens_Token1_TransfersToOwner() public {
+    vm.prank(owner);
+    vault.rescueTokens(TOKEN1_ADDR, 0.5 ether);
+    assertEq(token1.balanceOf(owner), 0.5 ether);
+}
 
     function test_RescueTokens_RevertNotOwner() public {
-        vm.prank(attacker);
-        vm.expectRevert(FluxVault.NotOwner.selector);
-        vault.rescueTokens(USDC_ADDR, 500e6);
-    }
-
+    vm.prank(attacker);
+    vm.expectRevert(FluxVault.NotOwner.selector);
+    vault.rescueTokens(TOKEN0_ADDR, 500e6);
+}
 
     // ═════════════════════════════════════════════════════════════════════════
     //  ADMIN — transferOwnership
@@ -929,7 +1000,7 @@ contract FluxVaultTest is Test {
         vault.transferOwnership(stranger);
         vm.prank(stranger);
         vault.setHalfWidth(1200); // should not revert
-        (,, int24 hw,,,,) = vault.config();
+        (, , int24 hw, , , , ) = vault.config();
         assertEq(hw, 1200);
     }
 
@@ -953,7 +1024,6 @@ contract FluxVaultTest is Test {
         vault.transferOwnership(stranger);
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  sttBalance + receive()
     // ═════════════════════════════════════════════════════════════════════════
@@ -965,11 +1035,10 @@ contract FluxVaultTest is Test {
     function test_Receive_AcceptsSTT() public {
         vm.deal(stranger, 5 ether);
         vm.prank(stranger);
-        (bool ok,) = address(vault).call{value: 5 ether}("");
+        (bool ok, ) = address(vault).call{value: 5 ether}("");
         assertTrue(ok);
         assertEq(address(vault).balance, STT_FUNDING + 5 ether);
     }
-
 
     // ═════════════════════════════════════════════════════════════════════════
     //  FUZZ — tick math
@@ -982,10 +1051,10 @@ contract FluxVaultTest is Test {
         pool.setTwapTick(tick);
         vm.prank(owner);
         vault.initializeFirstPosition(1_000e6, 1 ether, 0, 0);
-        (int24 tl, int24 tu,,,,,) = vault.config();
+        (int24 tl, int24 tu, , , , , ) = vault.config();
         assertEq(tl % TICK_SPACING, 0, "tickLower not aligned");
         assertEq(tu % TICK_SPACING, 0, "tickUpper not aligned");
-        assertTrue(tl < tu,             "tickLower must be < tickUpper");
+        assertTrue(tl < tu, "tickLower must be < tickUpper");
     }
 
     /// @dev After an out-of-range rebalance, the new range must contain newTick.
@@ -995,23 +1064,24 @@ contract FluxVaultTest is Test {
         pool.setTwapTick(newTick); // no manipulation
         vm.prank(PRECOMPILE_ADDR);
         vault.onEvent(address(pool), new bytes32[](0), _swapData(newTick));
-        (int24 tl, int24 tu,,,,,) = vault.config();
+        (int24 tl, int24 tu, , , , , ) = vault.config();
         assertTrue(newTick >= tl, "newTick below tickLower after rebalance");
-        assertTrue(newTick <  tu, "newTick above tickUpper after rebalance");
+        assertTrue(newTick < tu, "newTick above tickUpper after rebalance");
     }
 
     /// @dev Negative out-of-range rebalances should also contain the new tick.
-    function testFuzz_Rebalance_NegativeTick_NewRangeContainsTick(int24 newTick) public {
+    function testFuzz_Rebalance_NegativeTick_NewRangeContainsTick(
+        int24 newTick
+    ) public {
         newTick = int24(bound(newTick, -800_000, -700)); // force below initial range
         _initAndWatch();
         pool.setTwapTick(newTick);
         vm.prank(PRECOMPILE_ADDR);
         vault.onEvent(address(pool), new bytes32[](0), _swapData(newTick));
-        (int24 tl, int24 tu,,,,,) = vault.config();
+        (int24 tl, int24 tu, , , , , ) = vault.config();
         assertTrue(newTick >= tl, "newTick below tickLower after rebalance");
-        assertTrue(newTick <  tu, "newTick above tickUpper after rebalance");
+        assertTrue(newTick < tu, "newTick above tickUpper after rebalance");
     }
-
 
     // ═════════════════════════════════════════════════════════════════════════
     //  INTERNAL HELPERS
@@ -1021,13 +1091,14 @@ contract FluxVaultTest is Test {
     ///      Swap(address indexed, address indexed, int256, int256, uint160, uint128, int24)
     ///      Only the last 5 fields are in `data`.
     function _swapData(int24 tick) internal pure returns (bytes memory) {
-        return abi.encode(
-            int256(1_000e6),
-            int256(-0.5 ether),
-            uint160(79228162514264337593543950336),
-            uint128(1_000_000),
-            tick
-        );
+        return
+            abi.encode(
+                int256(1_000e6),
+                int256(-0.5 ether),
+                uint160(79228162514264337593543950336),
+                uint128(1_000_000),
+                tick
+            );
     }
 
     /// @dev Initialises first position and starts watching. Used in most tests.
@@ -1043,13 +1114,20 @@ contract FluxVaultTest is Test {
         vm.roll(block.number + n);
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
     //  EVENT DECLARATIONS — required by vm.expectEmit
     // ═════════════════════════════════════════════════════════════════════════
 
-    event Rebalanced(int24 indexed newTick, uint256 oldTokenId, uint256 newTokenId);
-    event PositionInitialized(uint256 indexed tokenId, int24 tickLower, int24 tickUpper);
+    event Rebalanced(
+        int24 indexed newTick,
+        uint256 oldTokenId,
+        uint256 newTokenId
+    );
+    event PositionInitialized(
+        uint256 indexed tokenId,
+        int24 tickLower,
+        int24 tickUpper
+    );
     event WatchingStarted(uint256 indexed subscriptionId);
     event WatchingStopped(uint256 indexed subscriptionId);
 }

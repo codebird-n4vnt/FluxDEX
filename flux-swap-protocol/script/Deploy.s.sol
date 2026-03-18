@@ -3,340 +3,241 @@ pragma solidity 0.8.19;
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  FLUXDEX — Deploy.s.sol
-//  Foundry deployment script for FluxVault on Somnia Testnet.
+//  Deployment script for FluxDEX on Somnia Testnet.
 //
-//  Execution order (single broadcast):
-//    1.  Deploy FluxVault
-//    2.  Fund vault with STT (≥ 32 STT for Reactivity subscription)
-//    3.  Transfer USDC + WETH from deployer to vault
-//    4.  Approve NPM inside vault (handled inside initializeFirstPosition)
-//    5.  initializeFirstPosition  → mints the first LP NFT
-//    6.  startWatching            → registers the Reactivity subscription
-//    7.  Log all key addresses + IDs to console
+//  What this script does in one broadcast:
+//    1.  Deploy FluxFactory
+//    2.  Mint BASE tokens to deployer  (MockERC20 has public mint())
+//    3.  Wrap STT → WETH              (WETH.deposit())
+//    4.  Approve WETH + BASE to FluxFactory
+//    5.  FluxFactory.createVault()    — sorts tokens, creates pool, deploys
+//                                       vault, seeds tokens, inits LP position,
+//                                       transfers ownership to deployer
+//    6.  vault.startWatching()        — primary Swap subscription
+//    7.  vault.startBackupWatcher()   — BlockTick backup subscription
+//    8.  Log all addresses for .env
 //
-//  Solidity 0.8.19 STRICT — never upgrade to 0.8.20+ (PUSH0 breaks Uniswap V3).
+//  Required .env variables:
+//    PRIVATE_KEY       — deployer key (must hold enough STT for gas + wrapping)
+//    NPM_ADDRESS       — NonfungiblePositionManager
+//    WETH_ADDRESS      — WETH token on Somnia testnet
+//    BASE_ADDRESS      — MockERC20 BASE token on Somnia testnet
 //
-//  Run (dry-run):
+//  Run (dry run — no broadcast):
 //    forge script script/Deploy.s.sol:DeployFluxDEX \
 //      --rpc-url https://api.infra.testnet.somnia.network \
 //      --gas-estimate-multiplier 200
 //
-//  Run (broadcast):
+//  Run (live):
 //    forge script script/Deploy.s.sol:DeployFluxDEX \
 //      --rpc-url https://api.infra.testnet.somnia.network \
 //      --gas-estimate-multiplier 200 \
 //      --broadcast \
-//      --slow                   ← sends txs one at a time; safer on Somnia testnet
-//
-//  Required environment variables (set in .env, never commit):
-//    PRIVATE_KEY          — deployer EOA private key (must hold STT, USDC, WETH)
-//    POOL_ADDRESS         — deployed Uniswap V3 USDC/WETH pool address
-//    NPM_ADDRESS          — deployed NonfungiblePositionManager address
-//
-//  Optional overrides (all have sensible defaults):
-//    HALF_WIDTH           — half-width of LP range in ticks (default: 600)
-//    TICK_SPACING         — pool tick spacing (default: 60 for 0.3% fee)
-//    AMOUNT0_DESIRED      — USDC to deposit for first position (default: 1000e6)
-//    AMOUNT1_DESIRED      — WETH to deposit for first position (default: 0.5e18)
-//    STT_FUNDING          — STT to send to vault in wei (default: 40e18 = 40 STT)
-//    GAS_LIMIT_HANDLER    — Reactivity handler gasLimit (default: 3_000_000)
+//      --slow
 // ════════════════════════════════════════════════════════════════════════════════
 
 import {Script, console2} from "forge-std/Script.sol";
+import {FluxFactory}      from "../src/FluxFactory.sol";
 import {FluxVault}        from "../src/FluxVault.sol";
 
-// ── Minimal ERC-20 transfer interface used by the script ─────────────────────
-interface IERC20Transfer {
-    function transfer(address to, uint256 amount) external returns (bool);
+// ── Minimal interfaces ────────────────────────────────────────────────────────
+
+interface IERC20Deploy {
+    function approve(address spender, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
-    function decimals() external view returns (uint8);
+}
+
+interface IMockERC20 is IERC20Deploy {
+    function mint(address to, uint256 amount) external;
+}
+
+interface IWETH is IERC20Deploy {
+    function deposit() external payable;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// @title  DeployFluxDEX
-/// @notice One-shot Foundry script that deploys and fully initialises FluxVault
-///         on the Somnia Testnet.
-/// @dev    All transactions are sent inside a single `vm.startBroadcast` session.
-///         The deployer wallet must hold sufficient:
-///           • STT  — for gas + the ≥ 32 STT Reactivity subscription minimum
-///           • USDC — for the initial LP position (USDC is token0)
-///           • WETH — for the initial LP position (WETH is token1)
 contract DeployFluxDEX is Script {
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  LOCKED CONSTANTS — Somnia Testnet
-    // ═══════════════════════════════════════════════════════════════════════
+    // ── Pool parameters ───────────────────────────────────────────────────────
+    uint24  constant POOL_FEE      = 3000;  // 0.3% fee tier, tick spacing = 60
+    int24   constant HALF_WIDTH    = 600;   // ±600 ticks around current price
 
-    /// @dev USDC on Somnia Testnet (token0 — lower address).
-    address constant USDC = 0x28bec7e30e6faee657a03e19bf1128aad7632a00;
+    // ── Token seed amounts ────────────────────────────────────────────────────
+    // Both WETH and BASE have 18 decimals.
+    uint256 constant WETH_SEED = 0.5 ether;   // 0.5 WETH wrapped from STT
+    uint256 constant BASE_SEED = 500 ether;   // 500 BASE minted from MockERC20
 
-    /// @dev WETH on Somnia Testnet (token1 — higher address).
-    address constant WETH = 0x936Ab8C674bcb567CD5dEB85D8A216494704E9D8;
+    // ── STT funding for vault ─────────────────────────────────────────────────
+    // Minimum required by Somnia Reactivity = 32 STT.
+    // We send 80 STT — gives buffer for ongoing BlockTick invocations.
+    uint256 constant STT_FOR_VAULT = 80 ether;
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  DEFAULTS  — override via env vars
-    // ═══════════════════════════════════════════════════════════════════════
+    // ── Initial pool price ────────────────────────────────────────────────────
+    // sqrtPriceX96 for a 1:1 ratio between two 18-decimal tokens.
+    // = sqrt(1) * 2^96 = 2^96
+    // Adjust this if WETH and BASE should start at a different ratio.
+    // To compute a custom ratio use FluxFactory.computeSqrtPriceX96().
+    uint160 constant SQRT_PRICE_1_TO_1 = 79228162514264337593543950336;
 
-    /// @dev ±600 ticks around current price (~6 % range for 0.3 % fee pool).
-    int24   constant DEFAULT_HALF_WIDTH        = 600;
-    int24   constant DEFAULT_TICK_SPACING      = 60;
+    // ── Reactivity gas limits ──────────────────────────────────────────────────
+    uint64 constant GAS_SWAP_HANDLER   = 3_000_000;
+    uint64 constant GAS_BACKUP_HANDLER = 2_000_000;
 
-    /// @dev 1 000 USDC (6 decimals) + 0.5 WETH (18 decimals).
-    uint256 constant DEFAULT_AMOUNT0_DESIRED   = 1_000e6;
-    uint256 constant DEFAULT_AMOUNT1_DESIRED   = 0.5 ether;
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// @dev 40 STT — comfortably above the 32 STT minimum, leaves buffer for fees.
-    uint256 constant DEFAULT_STT_FUNDING       = 40 ether;
-
-    /// @dev 3 M gas covers ~5 cold SLOADs + 4 Uniswap external calls.
-    uint64  constant DEFAULT_GAS_LIMIT_HANDLER = 3_000_000;
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  RUN
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// @notice Main entry point called by `forge script`.
     function run() external {
 
-        // ── 1. Load private key ───────────────────────────────────────────
+        // ── Load from .env ────────────────────────────────────────────────────
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address deployer    = vm.addr(deployerKey);
+        address npm         = vm.envAddress("NPM_ADDRESS");
+        address weth        = vm.envAddress("WETH_ADDRESS");
+        address base        = vm.envAddress("BASE_ADDRESS");
 
-        // ── 2. Load required addresses from env ───────────────────────────
-        address poolAddress = vm.envAddress("POOL_ADDRESS");
-        address npmAddress  = vm.envAddress("NPM_ADDRESS");
+        // ── Pre-flight ────────────────────────────────────────────────────────
+        console2.log("=== FluxDEX Pre-flight ===");
+        console2.log("Deployer:      ", deployer);
+        console2.log("NPM:           ", npm);
+        console2.log("WETH:          ", weth);
+        console2.log("BASE:          ", base);
+        console2.log("STT balance:   ", deployer.balance / 1e18, "STT");
+        console2.log("");
 
-        // ── 3. Load optional overrides (fall back to defaults) ────────────
-        int24 halfWidth = _envInt24("HALF_WIDTH",      DEFAULT_HALF_WIDTH);
-        int24 tickSpacing = _envInt24("TICK_SPACING",  DEFAULT_TICK_SPACING);
-
-        uint256 amount0Desired  = _envUint256("AMOUNT0_DESIRED",   DEFAULT_AMOUNT0_DESIRED);
-        uint256 amount1Desired  = _envUint256("AMOUNT1_DESIRED",   DEFAULT_AMOUNT1_DESIRED);
-        uint256 sttFunding      = _envUint256("STT_FUNDING",       DEFAULT_STT_FUNDING);
-        uint64  gasLimitHandler = uint64(_envUint256("GAS_LIMIT_HANDLER", DEFAULT_GAS_LIMIT_HANDLER));
-
-        // ── 4. Pre-flight checks ──────────────────────────────────────────
-        _preflightChecks(
-            deployer,
-            poolAddress,
-            npmAddress,
-            amount0Desired,
-            amount1Desired,
-            sttFunding
+        // Deployer needs: STT_FOR_VAULT + WETH_SEED (for wrapping) + gas buffer
+        uint256 sttNeeded = STT_FOR_VAULT + WETH_SEED + 10 ether;
+        require(
+            deployer.balance >= sttNeeded,
+            "Not enough STT. Need ~90.5 STT (80 for vault + 0.5 for WETH + 10 gas)"
         );
 
-        // ═════════════════════════════════════════════════════════════════
-        //  BROADCAST START
-        // ═════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════════
+        //  BROADCAST
+        // ═════════════════════════════════════════════════════════════════════
         vm.startBroadcast(deployerKey);
 
-        // ── Step 1: Deploy FluxVault ──────────────────────────────────────
-        console2.log("\n[1/5] Deploying FluxVault...");
+        // ── [1/7] Deploy FluxFactory ──────────────────────────────────────────
+        console2.log("[1/7] Deploying FluxFactory...");
+        FluxFactory factory = new FluxFactory(npm);
+        console2.log("      Address:", address(factory));
 
-        FluxVault vault = new FluxVault(
-            poolAddress,
-            npmAddress,
-            halfWidth,
-            tickSpacing
+        // ── [2/7] Mint BASE tokens to deployer ────────────────────────────────
+        // MockERC20 exposes a public mint() — anyone can call it on testnet.
+        console2.log("[2/7] Minting BASE tokens...");
+        IMockERC20(base).mint(deployer, BASE_SEED);
+        console2.log(
+            "      BASE balance:",
+            IMockERC20(base).balanceOf(deployer) / 1e18,
+            "BASE"
         );
 
-        console2.log("      FluxVault deployed at:", address(vault));
-
-        // ── Step 2: Fund vault with STT for Reactivity subscription ───────
-        // The vault's receive() accepts native token transfers.
-        // Reactivity requires the SUBSCRIPTION OWNER (= vault) to hold ≥ 32 STT.
-        console2.log("\n[2/5] Funding vault with STT...");
-        console2.log("      Sending:", sttFunding, "wei (", sttFunding / 1e18, " STT )");
-
-        (bool ok,) = address(vault).call{value: sttFunding}("");
-        require(ok, "Deploy: STT transfer to vault failed");
-
-        console2.log("      Vault STT balance:", address(vault).balance / 1e18, "STT");
-
-        // ── Step 3: Transfer tokens to vault for initial LP position ──────
-        console2.log("\n[3/5] Transferring tokens to vault...");
-        console2.log("      USDC:", amount0Desired / 1e6, "(6 dec)");
-        console2.log("      WETH:", amount1Desired, "wei");
-
-        bool ok0 = IERC20Transfer(USDC).transfer(address(vault), amount0Desired);
-        require(ok0, "Deploy: USDC transfer to vault failed");
-
-        bool ok1 = IERC20Transfer(WETH).transfer(address(vault), amount1Desired);
-        require(ok1, "Deploy: WETH transfer to vault failed");
-
-        // ── Step 4: Initialise the first LP position ──────────────────────
-        // This call:
-        //   • Approves the NPM for max USDC + WETH (done once, inside the vault)
-        //   • Reads pool.slot0() for current tick
-        //   • Mints the LP NFT centred on that tick ± halfWidth
-        //   • Sets config.initialized = true
-        console2.log("\n[4/5] Initializing first LP position...");
-
-        vault.initializeFirstPosition(
-            amount0Desired,
-            amount1Desired,
-            0,  // amount0Min — no slippage guard on testnet
-            0   // amount1Min
+        // ── [3/7] Wrap STT → WETH ─────────────────────────────────────────────
+        // WETH.deposit() converts native STT into ERC-20 WETH 1:1.
+        console2.log("[3/7] Wrapping STT into WETH...");
+        IWETH(weth).deposit{value: WETH_SEED}();
+        console2.log(
+            "      WETH balance:",
+            IWETH(weth).balanceOf(deployer) / 1e18,
+            "WETH"
         );
 
-        console2.log("      LP NFT token ID:", vault.tokenId());
-        (
-            int24 tl,
-            int24 tu,
-            int24 hw,
-            int24 ts,
-            uint24 fee,
-            bool  init,
-            bool  watching
-        ) = _unpackConfig(vault);
-        console2.log("      tickLower:", tl);
-        console2.log("      tickUpper:", tu);
-        console2.log("      poolFee:  ", fee);
-        console2.log("      initialized:", init);
+        // ── [4/7] Approve tokens to FluxFactory ───────────────────────────────
+        // Factory pulls tokens from deployer via transferFrom inside createVault().
+        console2.log("[4/7] Approving tokens to FluxFactory...");
+        IERC20Deploy(weth).approve(address(factory), WETH_SEED);
+        IERC20Deploy(base).approve(address(factory), BASE_SEED);
+        console2.log("      Approved WETH + BASE");
 
-        // Suppress unused var warnings (halfWidth, tickSpacing, watching
-        // are correct but we only log the ones needed for verification)
-        hw; ts; watching;
+        // ── [5/7] Create pool + vault ─────────────────────────────────────────
+        // Factory internally:
+        //   • Sorts WETH and BASE by address (WETH 0x936 < BASE 0x96E → token0=WETH)
+        //   • Calls NPM.createAndInitializePoolIfNecessary → creates pool
+        //   • Deploys FluxVault(pool, npm, halfWidth, tickSpacing, token0, token1)
+        //   • Forwards msg.value (80 STT) to vault.receive()
+        //   • Pulls WETH + BASE from deployer into vault via transferFrom
+        //   • Calls vault.initializeFirstPosition()
+        //   • Transfers vault ownership to deployer (msg.sender)
+        //   • Registers pool → vault in factory registry
+        //
+        // msg.value = STT_FOR_VAULT is forwarded to the vault for subscriptions.
+        console2.log("[5/7] Creating pool and vault...");
+        console2.log("      Fee:      0.3% (3000)");
+        console2.log("      Range:    +-600 ticks");
+        console2.log("      STT sent: 80 STT");
 
-        // ── Step 5: Register Reactivity subscription ──────────────────────
-        // startWatching calls PRECOMPILE.subscribe(SubscriptionData) which:
-        //   • Filters on pool address + SWAP_TOPIC
-        //   • Sets handlerFunctionSelector = onEvent.selector
-        //   • Uses priorityFeePerGas=2gwei, maxFeePerGas=10gwei
-        //   • Sets isGuaranteed=true, isCoalesced=false
-        console2.log("\n[5/5] Starting Reactivity subscription...");
-        console2.log("      gasLimit:", gasLimitHandler);
+        (address vaultAddress, address poolAddress) = factory.createVault{
+            value: STT_FOR_VAULT
+        }(
+            weth,              // tokenA — factory sorts, order doesn't matter
+            base,              // tokenB
+            POOL_FEE,          // 3000
+            SQRT_PRICE_1_TO_1, // 1:1 starting price
+            WETH_SEED,         // amount0Desired — WETH is token0 after sorting
+            BASE_SEED,         // amount1Desired — BASE is token1 after sorting
+            HALF_WIDTH         // ±600 ticks
+        );
 
-        vault.startWatching(gasLimitHandler);
+        FluxVault vault = FluxVault(payable(vaultAddress));
 
+        console2.log("      Pool:          ", poolAddress);
+        console2.log("      Vault:         ", vaultAddress);
+        console2.log("      LP Token ID:   ", vault.tokenId());
+        console2.log("      Vault STT:     ", vault.sttBalance() / 1e18, "STT");
+        console2.log("      Vault owner:   ", vault.owner());
+
+        // Sanity check
+        require(vault.owner() == deployer, "Vault owner is not deployer");
+
+        // ── [6/7] Start primary Swap subscription ─────────────────────────────
+        // Vault subscribes to pool's Swap events via Somnia Reactivity precompile.
+        // When a swap pushes tick out of [tickLower, tickUpper], onEvent() fires
+        // in the next block and _rebalance() recenters the LP position.
+        console2.log("[6/7] Starting Swap subscription (primary)...");
+        vault.startWatching(GAS_SWAP_HANDLER);
         console2.log("      Subscription ID:", vault.subscriptionId());
-        console2.log("      Vault is watching:", true);
+
+        // ── [7/7] Start BlockTick backup subscription ─────────────────────────
+        // Fires every 50 blocks as a self-healing fallback.
+        // Checks pool.slot0() directly and rebalances if tick is out of range.
+        // Protects against missed Swap event deliveries.
+        console2.log("[7/7] Starting BlockTick backup subscription...");
+        vault.startBackupWatcher(GAS_BACKUP_HANDLER);
+        console2.log("      Backup Sub ID: ", vault.backupSubscriptionId());
 
         vm.stopBroadcast();
-        // ═════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════════
         //  BROADCAST END
-        // ═════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════════
 
-        // ── Summary ───────────────────────────────────────────────────────
-        _logSummary(vault, poolAddress, npmAddress, deployer);
+        _logSummary(deployer, address(factory), vaultAddress, poolAddress, weth, base);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  INTERNAL HELPERS
-    // ═══════════════════════════════════════════════════════════════════════
+    // ── Summary ───────────────────────────────────────────────────────────────
 
-    /// @dev Validates all pre-conditions before spending any gas on broadcast.
-    ///      Reverts with a descriptive message if any check fails.
-    function _preflightChecks(
-        address deployer,
-        address poolAddress,
-        address npmAddress,
-        uint256 amount0Desired,
-        uint256 amount1Desired,
-        uint256 sttFunding
-    ) internal view {
-        console2.log("=== FluxDEX Pre-flight Checks ===");
-        console2.log("Deployer:          ", deployer);
-        console2.log("Pool:              ", poolAddress);
-        console2.log("NPM:               ", npmAddress);
-
-        // Addresses non-zero
-        require(poolAddress != address(0), "Preflight: POOL_ADDRESS is zero");
-        require(npmAddress  != address(0), "Preflight: NPM_ADDRESS is zero");
-
-        // Deployer STT balance (needs gas + sttFunding)
-        uint256 deployerSTT = deployer.balance;
-        console2.log("Deployer STT bal:  ", deployerSTT / 1e18, "STT");
-        require(
-            deployerSTT >= sttFunding + 5 ether, // 5 STT buffer for gas
-            "Preflight: deployer does not have enough STT (needs sttFunding + 5 STT gas buffer)"
-        );
-
-        // Deployer USDC balance
-        uint256 deployerUSDC = IERC20Transfer(USDC).balanceOf(deployer);
-        console2.log("Deployer USDC bal: ", deployerUSDC / 1e6, "USDC");
-        require(
-            deployerUSDC >= amount0Desired,
-            "Preflight: deployer does not have enough USDC"
-        );
-
-        // Deployer WETH balance
-        uint256 deployerWETH = IERC20Transfer(WETH).balanceOf(deployer);
-        console2.log("Deployer WETH bal: ", deployerWETH, "wei WETH");
-        require(
-            deployerWETH >= amount1Desired,
-            "Preflight: deployer does not have enough WETH"
-        );
-
-        console2.log("=== All pre-flight checks passed ===\n");
-    }
-
-    /// @dev Prints a structured deployment summary to console.
     function _logSummary(
-        FluxVault vault,
-        address   poolAddress,
-        address   npmAddress,
-        address   deployer
-    ) internal view {
-        console2.log("\n");
-        console2.log("╔══════════════════════════════════════════╗");
-        console2.log("║         FluxDEX Deployment Summary       ║");
-        console2.log("╠══════════════════════════════════════════╣");
-        console2.log("║ Network   : Somnia Testnet (50312)       ║");
-        console2.log("╠══════════════════════════════════════════╣");
-        console2.log("Deployer       :", deployer);
-        console2.log("FluxVault      :", address(vault));
-        console2.log("Pool           :", poolAddress);
-        console2.log("NPM            :", npmAddress);
-        console2.log("USDC (token0)  :", USDC);
-        console2.log("WETH (token1)  :", WETH);
-        console2.log("--------------------------------------------");
-        console2.log("LP Token ID    :", vault.tokenId());
-        console2.log("Subscription ID:", vault.subscriptionId());
-        console2.log("Vault STT      :", address(vault).balance / 1e18, "STT");
-        console2.log("╚══════════════════════════════════════════╝");
-        console2.log("\nExplorer: https://shannon-explorer.somnia.network/address/", address(vault));
-    }
+        address deployer,
+        address factory,
+        address vault,
+        address pool,
+        address weth,
+        address base
+    ) internal pure {
+        console2.log("");
+        console2.log("=====================================================");
+        console2.log("FluxDEX Deployed");
+        console2.log("=====================================================");
+        console2.log("  Deployer     :", deployer);
+        console2.log("  FluxFactory  :", factory);
+        console2.log("  FluxVault    :", vault);
+        console2.log("  Pool (WETH/BASE):", pool);
+        console2.log("  WETH token   :", weth);
+        console2.log("  BASE token   :", base);
+        console2.log("  FLUX_FACTORY_ADDRESS=", factory);
+        console2.log("  FLUX_VAULT_ADDRESS=  ", vault);
+        console2.log("  POOL_ADDRESS=        ", pool);
 
-    /// @dev Unpacks the VaultConfig struct from the vault's public getter.
-    ///      The Solidity compiler generates a tuple getter for public structs.
-    function _unpackConfig(FluxVault vault)
-        internal
-        view
-        returns (
-            int24  tickLower,
-            int24  tickUpper,
-            int24  halfWidth,
-            int24  tickSpacing,
-            uint24 poolFee,
-            bool   initialized,
-            bool   watching
-        )
-    {
-        (tickLower, tickUpper, halfWidth, tickSpacing, poolFee, initialized, watching)
-            = vault.config();
-    }
-
-    // ── Safe env helpers ──────────────────────────────────────────────────
-
-    /// @dev Reads a uint256 env var, returning `defaultVal` if unset.
-    function _envUint256(string memory key, uint256 defaultVal)
-        internal
-        view
-        returns (uint256)
-    {
-        try vm.envUint(key) returns (uint256 v) { return v; }
-        catch                                    { return defaultVal; }
-    }
-
-    /// @dev Reads an int24 env var (stored as int256), returning `defaultVal` if unset.
-    function _envInt24(string memory key, int24 defaultVal)
-        internal
-        view
-        returns (int24)
-    {
-        try vm.envInt(key) returns (int256 v) { return int24(v); }
-        catch                                  { return defaultVal; }
+        console2.log("  Explorer:");
+        console2.log("  https://shannon-explorer.somnia.network/address/", vault);
+        console2.log("=====================================================");
     }
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.19;
+pragma solidity ^0.8.0;
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  FLUXDEX — FluxVault.sol
@@ -423,26 +423,32 @@ contract FluxVault {
     //  MODIFIERS
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @dev Reverts with `NotOwner` if the caller is not `owner`.
     modifier onlyOwner() {
+        _onlyOwner();
+        _;
+    }
+    function _onlyOwner() internal {
         if (msg.sender != owner) revert NotOwner();
-        _;
     }
 
-    /// @dev Reverts with `NotPrecompile` if the caller is not the Reactivity precompile.
-    ///      Replaces the `onlyReactivityPrecompile` guard from `SomniaEventHandler`.
     modifier onlyPrecompile() {
-        if (msg.sender != address(PRECOMPILE)) revert NotPrecompile();
+        _onlyPrecompile();
         _;
     }
+    function _onlyPrecompile() internal {
+        if (msg.sender != address(PRECOMPILE)) revert NotPrecompile();
+    }
 
-    /// @dev Reverts with `Reentrancy` if a call is already in progress.
-    ///      Uses 1/2 instead of false/true so the slot stays warm between calls,
-    ///      keeping re-lock cost at ~100 gas (warm SSTORE) on Somnia's gas model.
     modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+    function _nonReentrantBefore() internal {
         if (_locked == 2) revert Reentrancy();
         _locked = 2;
-        _;
+    }
+    function _nonReentrantAfter() internal {
         _locked = 1;
     }
 
@@ -468,6 +474,10 @@ contract FluxVault {
         address _token1
     ) {
         if (_pool == address(0) || _npm == address(0)) revert ZeroAddress();
+        if (_token0 == address(0) || _token1 == address(0))
+            revert ZeroAddress();
+        token0 = _token0;
+        token1 = _token1;
         if (_halfWidth <= 0 || _tickSpacing <= 0) revert InvalidTickRange();
 
         owner = msg.sender;
@@ -831,6 +841,8 @@ contract FluxVault {
             uint160[] memory
         ) {
             int56 delta = tickCumulatives[1] - tickCumulatives[0];
+            // forge-lint: disable-next-line(unsafe-typecast)
+            // Safe: TWAP_WINDOW=300, max delta over 300s fits well within int24 range
             twapTick = int24(delta / int56(uint56(TWAP_WINDOW)));
             available = true;
         } catch {

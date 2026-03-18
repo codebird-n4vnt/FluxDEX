@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.19;
+pragma solidity ^0.8.0;
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  FLUXDEX — FluxFactory.sol
@@ -53,18 +53,24 @@ interface INPMFactory {
     function createAndInitializePoolIfNecessary(
         address token0,
         address token1,
-        uint24  fee,
+        uint24 fee,
         uint160 sqrtPriceX96
     ) external payable returns (address pool);
 }
 
 /// @notice Minimal ERC-20 interface used by the factory.
 interface IERC20Factory {
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function allowance(address owner, address spender) external view returns (uint256);
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+    function allowance(
+        address owner,
+        address spender
+    ) external view returns (uint256);
     function balanceOf(address account) external view returns (uint256);
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  FLUXFACTORY
@@ -87,7 +93,6 @@ interface IERC20Factory {
 ///         creation + 3,125 gas/byte of bytecode. createVault() should be called
 ///         with --gas-estimate-multiplier 200 in Foundry.
 contract FluxFactory {
-
     // ═══════════════════════════════════════════════════════════════════════════
     //  CUSTOM ERRORS
     // ═══════════════════════════════════════════════════════════════════════════
@@ -122,11 +127,14 @@ contract FluxFactory {
     /// @param token    The token with insufficient allowance.
     /// @param required Amount required.
     /// @param actual   Current allowance.
-    error InsufficientAllowance(address token, uint256 required, uint256 actual);
+    error InsufficientAllowance(
+        address token,
+        uint256 required,
+        uint256 actual
+    );
 
     /// @dev Reverts when a native STT transfer fails.
     error STTTransferFailed();
-
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  CONSTANTS
@@ -134,7 +142,6 @@ contract FluxFactory {
 
     /// @notice Minimum STT the vault must hold for a Reactivity subscription.
     uint256 public constant MIN_STT_FUNDING = 32 ether;
-
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  STORAGE
@@ -171,7 +178,6 @@ contract FluxFactory {
     /// @dev    Useful for iterating all deployed vaults.
     mapping(uint256 => address) public vaultByIndex;
 
-
     // ═══════════════════════════════════════════════════════════════════════════
     //  EVENTS  (minimal — Somnia LOG ≈ 13× Ethereum)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -188,26 +194,30 @@ contract FluxFactory {
         address indexed vault,
         address token0,
         address token1,
-        uint24  fee,
+        uint24 fee,
         address indexed deployer
     );
 
     /// @notice Emitted when the factory owner changes.
-    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event OwnershipTransferred(
+        address indexed oldOwner,
+        address indexed newOwner
+    );
 
     /// @notice Emitted when the npm address is updated.
     event NpmUpdated(address indexed oldNpm, address indexed newNpm);
-
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  MODIFIERS
     // ═══════════════════════════════════════════════════════════════════════════
 
     modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
+        _onlyOwner();
         _;
     }
-
+    function _onlyOwner() internal {
+        if (msg.sender != owner) revert NotOwner();
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  CONSTRUCTOR
@@ -218,9 +228,8 @@ contract FluxFactory {
     constructor(address _npm) {
         if (_npm == address(0)) revert ZeroAddress();
         owner = msg.sender;
-        npm   = _npm;
+        npm = _npm;
     }
-
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  CORE — CREATE VAULT
@@ -256,13 +265,12 @@ contract FluxFactory {
     function createVault(
         address tokenA,
         address tokenB,
-        uint24  fee,
+        uint24 fee,
         uint160 sqrtPriceX96,
         uint256 amount0Desired,
         uint256 amount1Desired,
-        int24   halfWidth
+        int24 halfWidth
     ) external payable returns (address vault, address pool) {
-
         // ── Pre-flight ────────────────────────────────────────────────────────
         if (tokenA == address(0) || tokenB == address(0)) revert ZeroAddress();
         if (msg.value < MIN_STT_FUNDING)
@@ -284,11 +292,17 @@ contract FluxFactory {
         // ── Step 3: Validate allowances before touching anything ──────────────
         // Fail fast before any state changes or deployments.
         {
-            uint256 allow0 = IERC20Factory(token0).allowance(msg.sender, address(this));
+            uint256 allow0 = IERC20Factory(token0).allowance(
+                msg.sender,
+                address(this)
+            );
             if (allow0 < amount0Desired)
                 revert InsufficientAllowance(token0, amount0Desired, allow0);
 
-            uint256 allow1 = IERC20Factory(token1).allowance(msg.sender, address(this));
+            uint256 allow1 = IERC20Factory(token1).allowance(
+                msg.sender,
+                address(this)
+            );
             if (allow1 < amount1Desired)
                 revert InsufficientAllowance(token1, amount1Desired, allow1);
         }
@@ -330,16 +344,24 @@ contract FluxFactory {
         // ── Step 7: Fund vault with STT ───────────────────────────────────────
         // Forwards the caller's msg.value to vault.receive() for the Reactivity
         // subscription minimum (32 STT) plus ongoing fee buffer.
-        (bool ok,) = vault.call{value: msg.value}("");
+        (bool ok, ) = vault.call{value: msg.value}("");
         if (!ok) revert STTTransferFailed();
 
         // ── Step 8: Pull tokens from caller into vault ────────────────────────
         // The factory acts as a conduit — tokens go caller → factory → vault
         // in a single atomic sequence. The factory never holds tokens at rest.
-        bool ok0 = IERC20Factory(token0).transferFrom(msg.sender, vault, amount0Desired);
+        bool ok0 = IERC20Factory(token0).transferFrom(
+            msg.sender,
+            vault,
+            amount0Desired
+        );
         if (!ok0) revert TokenTransferFailed();
 
-        bool ok1 = IERC20Factory(token1).transferFrom(msg.sender, vault, amount1Desired);
+        bool ok1 = IERC20Factory(token1).transferFrom(
+            msg.sender,
+            vault,
+            amount1Desired
+        );
         if (!ok1) revert TokenTransferFailed();
 
         // ── Step 9: Initialize first LP position ─────────────────────────────
@@ -349,7 +371,7 @@ contract FluxFactory {
             amount0Desired,
             amount1Desired,
             0, // amount0Min — no slippage guard; caller can add if desired
-            0  // amount1Min
+            0 // amount1Min
         );
 
         // ── Step 10: Transfer vault ownership to caller ───────────────────────
@@ -359,7 +381,7 @@ contract FluxFactory {
 
         // ── Step 11: Register in factory state ───────────────────────────────
         // Three storage writes — batched at the end to keep earlier slots warm.
-        uint256 index     = vaultCount;    // cache before increment
+        uint256 index = vaultCount; // cache before increment
         vaultByPool[pool] = vault;
         poolByVault[vault] = pool;
         vaultByIndex[index] = vault;
@@ -367,7 +389,6 @@ contract FluxFactory {
 
         emit VaultCreated(pool, vault, token0, token1, fee, msg.sender);
     }
-
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  VIEW HELPERS
@@ -417,7 +438,6 @@ contract FluxFactory {
         }
     }
 
-
     // ═══════════════════════════════════════════════════════════════════════════
     //  ADMIN FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════════════
@@ -441,7 +461,6 @@ contract FluxFactory {
         npm = _npm;
     }
 
-
     // ═══════════════════════════════════════════════════════════════════════════
     //  INTERNAL HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
@@ -451,8 +470,8 @@ contract FluxFactory {
     ///      Derived from Uniswap V3 factory tickSpacingToFee mapping:
     ///        10 → 500  | 60 → 3000  | 200 → 10000
     function _tickSpacingForFee(uint24 fee) internal pure returns (int24) {
-        if (fee == 500)   return 10;
-        if (fee == 3000)  return 60;
+        if (fee == 500) return 10;
+        if (fee == 3000) return 60;
         if (fee == 10000) return 200;
         revert UnsupportedFeeTier(fee);
     }
