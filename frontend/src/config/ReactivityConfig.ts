@@ -1,7 +1,7 @@
 import { defineChain, createPublicClient, createWalletClient, http } from 'viem'
 import { SDK } from '@somnia-chain/reactivity'
 
-const somniaTestnet = defineChain({
+export const somniaTestnet = defineChain({
   id: 50312,
   name: 'Somnia Testnet',
   nativeCurrency: { name: 'STT', symbol: 'STT', decimals: 18 },
@@ -16,18 +16,18 @@ const somniaTestnet = defineChain({
   }
 })
 
-const publicClient = createPublicClient({
+export const publicClient = createPublicClient({
   chain: somniaTestnet,
   transport: http()
 })
 
 // Optional: Wallet client for on-chain writes
-const walletClient = createWalletClient({
+export const walletClient = createWalletClient({
   chain: somniaTestnet,
   transport: http()
 })
 
-const sdk = new SDK({
+export const sdk = new SDK({
   public: publicClient,
   wallet: walletClient // omit if not executing on-chain transactions
 })

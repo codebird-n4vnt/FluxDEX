@@ -37,15 +37,6 @@ import {Script, console2} from "forge-std/Script.sol";
 import {FluxFactory}      from "../src/FluxFactory.sol";
 import {FluxVault}        from "../src/FluxVault.sol";
 
-// ── Uniswap V3 Core ───────────────────────────────────────────────────────────
-import {UniswapV3Factory} from
-    "lib/v3-core/contracts/UniswapV3Factory.sol";
-
-// ── Uniswap V3 Periphery ──────────────────────────────────────────────────────
-import {NonfungiblePositionManager} from
-    "lib/v3-periphery/contracts/NonfungiblePositionManager.sol";
-import {SwapRouter} from
-    "lib/v3-periphery/contracts/SwapRouter.sol";
 
 // ── Minimal ERC-20 interface ──────────────────────────────────────────────────
 interface IERC20Deploy {
@@ -74,13 +65,15 @@ contract DeployAll is Script {
         // ── Load env ─────────────────────────────────────────────────────────
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address deployer    = vm.addr(deployerKey);
+        address npm         = vm.envAddress("NPM_ADDRESS");
         address myWETH      = vm.envAddress("MY_WETH");
         address myBASE      = vm.envAddress("MY_BASE");
 
         console2.log("============================================");
-        console2.log("  FluxDEX Full Deployment — Somnia Testnet");
+        console2.log("Complete deployment");
         console2.log("============================================");
         console2.log("Deployer :", deployer);
+        console2.log("NPM      :", npm);
         console2.log("myBASE   :", myBASE);
         console2.log("myWETH   :", myWETH);
         console2.log("");
@@ -105,32 +98,11 @@ contract DeployAll is Script {
         vm.startBroadcast(deployerKey);
         // ═════════════════════════════════════════════════════════════════════
 
-        // ── Step 1: UniswapV3Factory ──────────────────────────────────────────
-        console2.log("[1/8] Deploying UniswapV3Factory...");
-        UniswapV3Factory uniFactory = new UniswapV3Factory();
-        console2.log("      Done:", address(uniFactory));
-
-        // ── Step 2: NonfungiblePositionManager ───────────────────────────────
-        // Args: factory, WETH9 (use myWETH), tokenDescriptor (address(0) = no SVG)
-        console2.log("[2/8] Deploying NonfungiblePositionManager...");
-        NonfungiblePositionManager npm = new NonfungiblePositionManager(
-            address(uniFactory),
-            myWETH,
-            address(0)
-        );
-        console2.log("      Done:", address(npm));
-
-        // ── Step 3: SwapRouter ────────────────────────────────────────────────
-        console2.log("[3/8] Deploying SwapRouter...");
-        SwapRouter swapRouter = new SwapRouter(
-            address(uniFactory),
-            myWETH
-        );
-        console2.log("      Done:", address(swapRouter));
+        
 
         // ── Step 4: FluxFactory ───────────────────────────────────────────────
         console2.log("[4/8] Deploying FluxFactory...");
-        FluxFactory fluxFactory = new FluxFactory(address(npm));
+        FluxFactory fluxFactory = new FluxFactory(npm);
         console2.log("      Done:", address(fluxFactory));
 
         // ── Step 5: Approve tokens to FluxFactory ────────────────────────────
@@ -176,9 +148,6 @@ contract DeployAll is Script {
         console2.log("============================================");
         console2.log("  All contracts deployed successfully");
         console2.log("============================================");
-        console2.log("UniswapV3Factory :", address(uniFactory));
-        console2.log("NPM              :", address(npm));
-        console2.log("SwapRouter       :", address(swapRouter));
         console2.log("FluxFactory      :", address(fluxFactory));
         console2.log("Pool             :", poolAddr);
         console2.log("Vault            :", vaultAddr);
@@ -191,18 +160,6 @@ contract DeployAll is Script {
             vaultAddr);
         console2.log("============================================");
 
-        // ── Write deployment.env ──────────────────────────────────────────────
-        vm.writeFile(
-            "deployment.env",
-            string.concat(
-                "FACTORY_ADDRESS=",      vm.toString(address(uniFactory)), "\n",
-                "NPM_ADDRESS=",          vm.toString(address(npm)),         "\n",
-                "SWAP_ROUTER_ADDRESS=",  vm.toString(address(swapRouter)),  "\n",
-                "FLUX_FACTORY_ADDRESS=", vm.toString(address(fluxFactory)), "\n",
-                "POOL_ADDRESS=",         vm.toString(poolAddr),             "\n",
-                "VAULT_ADDRESS=",        vm.toString(vaultAddr),            "\n"
-            )
-        );
         console2.log("Addresses saved to deployment.env");
     }
 }

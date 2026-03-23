@@ -7,9 +7,12 @@
   },
   "lib/openzeppelin-contracts": {
     "tag": {
-      "name": "v4.8.3",
-      "rev": "0a25c1940ca220686588c4af3ec526f725fe2582"
+      "name": "v5.6.1",
+      "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
     }
+  },
+  "lib/v2-periphery": {
+    "rev": "0335e8f7e1bd1e8d8329fd300aea2ef2f36dd19f"
   },
   "lib/v3-core": {
     "branch": {
@@ -18,9 +21,6 @@
     }
   },
   "lib/v3-periphery": {
-    "branch": {
-      "name": "0.8",
-      "rev": "b325bb0905d922ae61fcc7df85ee802e8df5e96c"
-    }
+    "rev": "80f26c86c57b8a5e4b913f42844d4c8bd274d058"
   }
 }
