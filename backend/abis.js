@@ -22,6 +22,13 @@ export const FACTORY_ABI = [
   // ── Read functions ───────────────────────────────────────────────────────
   {
     type: "function",
+    name: "getAllVaults",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "vaults", type: "address[]" }],
+  },
+  {
+    type: "function",
     name: "vaultCount",
     stateMutability: "view",
     inputs: [],
@@ -76,6 +83,27 @@ export const VAULT_ABI = [
   {
     type: "function",
     name: "pool",
+    stateMutability: "view",
+    inputs:  [],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "token0",
+    stateMutability: "view",
+    inputs:  [],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "token1",
+    stateMutability: "view",
+    inputs:  [],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "owner",
     stateMutability: "view",
     inputs:  [],
     outputs: [{ type: "address" }],

@@ -37,17 +37,33 @@ async function boot() {
   console.log("║       Somnia Testnet  (50312)        ║");
   console.log("╚══════════════════════════════════════╝\n");
 
+  console.log("[Boot] Config:");
+  console.log(`  FACTORY_ADDRESS .... ${process.env.FACTORY_ADDRESS ?? "NOT SET"}`);
+  console.log(`  RPC_URL ........... ${process.env.RPC_URL ?? "(default)"}`);
+  console.log(`  WSS_URL ........... ${process.env.WSS_URL ?? "(default)"}`);
+  console.log(`  PORT .............. ${PORT}`);
+  console.log(`  POLL_INTERVAL ..... ${process.env.POLL_INTERVAL_MS ?? 5000}ms\n`);
+
   // 1. Load Uniswap token list so metadata is ready before indexer starts
-  await loadUniswapTokenList();
+  try {
+    await loadUniswapTokenList();
+  } catch (err) {
+    console.warn("[Boot] Token list load failed (non-fatal):", err.message);
+  }
 
-  // 2. Start indexer — historical sync, live WSS subs, polling loop
-  await startIndexer();
-
-  // 3. Start listening
+  // 2. Start HTTP server FIRST so frontend can connect immediately
+  //    (indexer historical sync can take minutes on slow RPCs)
   httpServer.listen(PORT, () => {
     console.log(`\n[Server] REST API  → http://localhost:${PORT}/api`);
     console.log(`[Server] Socket.io → ws://localhost:${PORT}`);
     console.log(`[Server] Health    → http://localhost:${PORT}/api/health\n`);
+  });
+
+  // 3. Start indexer in the background — historical sync, live WSS subs, polling
+  //    This runs asynchronously; the API will serve empty results until sync finishes.
+  startIndexer().catch((err) => {
+    console.error("[Boot] Indexer start failed:", err.message);
+    console.error("[Boot] Backend will still serve API but with no indexed data.");
   });
 }
 

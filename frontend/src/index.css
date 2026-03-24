@@ -1,68 +1,144 @@
-:root {
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
+@import "tailwindcss";
 
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+/* ─────────────────────────────────────────────────────────────────────────────
+   FluxVault — Design System
+   Dark DeFi aesthetic with glassmorphism, neon accents, and fluid animations
+   ───────────────────────────────────────────────────────────────────────────── */
 
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
+@theme {
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* ── Core palette ──────────────────────────────────────────────────────── */
+  --color-bg-primary: #06080f;
+  --color-bg-secondary: #0c1020;
+  --color-bg-card: rgba(15, 20, 40, 0.65);
+  --color-bg-card-hover: rgba(20, 28, 55, 0.75);
+  --color-bg-input: rgba(12, 16, 32, 0.8);
+
+  --color-border: rgba(255, 255, 255, 0.06);
+  --color-border-glow: rgba(0, 212, 255, 0.2);
+  --color-border-hover: rgba(0, 212, 255, 0.35);
+
+  --color-text-primary: #e8ecf4;
+  --color-text-secondary: #7a85a0;
+  --color-text-tertiary: #4a5270;
+
+  --color-neon-blue: #00d4ff;
+  --color-neon-pink: #ff006e;
+  --color-neon-green: #39ff14;
+  --color-neon-purple: #a855f7;
+  --color-neon-amber: #f59e0b;
+
+  --color-status-success: #22c55e;
+  --color-status-warning: #f59e0b;
+  --color-status-danger: #ef4444;
+  --color-status-info: #00d4ff;
+}
+
+/* ── Global resets ───────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-a:hover {
-  color: #535bf2;
+  text-rendering: optimizeLegibility;
 }
 
 body {
   margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
+  font-family: var(--font-sans);
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
   min-height: 100vh;
+  overflow-x: hidden;
 }
 
-h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
+/* Animated mesh gradient background */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(ellipse 80% 50% at 20% 10%, rgba(0, 212, 255, 0.08) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 80%, rgba(255, 0, 110, 0.06) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 50% at 50% 50%, rgba(57, 255, 20, 0.03) 0%, transparent 70%);
+  animation: bg-drift 20s ease-in-out infinite alternate;
 }
 
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  background-color: #1a1a1a;
-  cursor: pointer;
-  transition: border-color 0.25s;
-}
-button:hover {
-  border-color: #646cff;
-}
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
+@keyframes bg-drift {
+  0% { transform: scale(1) translate(0, 0); }
+  100% { transform: scale(1.08) translate(-2%, 3%); }
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color: #213547;
-    background-color: #ffffff;
-  }
-  a:hover {
-    color: #747bff;
-  }
-  button {
-    background-color: #f9f9f9;
-  }
+/* ── Scrollbar ───────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* ── Glass utility ───────────────────────────────────────────────────────── */
+.glass {
+  background: var(--color-bg-card);
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+}
+
+.glass-hover:hover {
+  background: var(--color-bg-card-hover);
+  border-color: var(--color-border-glow);
+  box-shadow: 0 0 30px rgba(0, 212, 255, 0.06);
+}
+
+/* ── Neon glow ───────────────────────────────────────────────────────────── */
+.glow-blue { box-shadow: 0 0 20px rgba(0, 212, 255, 0.15), 0 0 60px rgba(0, 212, 255, 0.05); }
+.glow-green { box-shadow: 0 0 20px rgba(57, 255, 20, 0.15), 0 0 60px rgba(57, 255, 20, 0.05); }
+.glow-pink { box-shadow: 0 0 20px rgba(255, 0, 110, 0.15), 0 0 60px rgba(255, 0, 110, 0.05); }
+.text-glow-blue { text-shadow: 0 0 20px rgba(0, 212, 255, 0.4); }
+
+/* ── Pulse animation for status badges ───────────────────────────────────── */
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; box-shadow: 0 0 4px currentColor; }
+  50% { opacity: 0.6; box-shadow: 0 0 12px currentColor; }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* ── Gradient text ───────────────────────────────────────────────────────── */
+.gradient-text {
+  background: linear-gradient(135deg, var(--color-neon-blue) 0%, var(--color-neon-purple) 50%, var(--color-neon-pink) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── RainbowKit overrides ────────────────────────────────────────────────── */
+[data-rk] * {
+  font-family: var(--font-sans) !important;
+}
+
+/* ── Rebalance flash ─────────────────────────────────────────────────────── */
+@keyframes rebalance-flash {
+  0% { background: rgba(57, 255, 20, 0.2); }
+  100% { background: transparent; }
+}
+
+.rebalance-flash {
+  animation: rebalance-flash 1.5s ease-out forwards;
 }

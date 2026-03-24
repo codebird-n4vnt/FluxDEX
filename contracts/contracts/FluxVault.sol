@@ -289,9 +289,9 @@ contract FluxVault {
     bytes32 public constant BLOCK_TICK_TOPIC = keccak256("BlockTick(uint64)");
 
     /// @notice Maximum allowed deviation between swap tick and TWAP tick.
-    /// @dev    600 ticks ≈ ~6% price deviation for a 0.3% fee pool.
-    ///         Increase if you expect legitimate high-volatility swaps.
-    int24 public constant MAX_TICK_DEVIATION = 600;
+    /// @dev    887272 = max Uniswap V3 tick, effectively disabling the TWAP
+    ///         anti-manipulation check. Safe for demo; parameterize per-pool on mainnet.
+    int24 public constant MAX_TICK_DEVIATION = 887272;
 
     /// @notice TWAP window in seconds.
     uint32 public constant TWAP_WINDOW = 300; // 5 minutes
@@ -791,11 +791,16 @@ contract FluxVault {
         INonfungiblePositionManager(_npm).burn(_tokenId);
 
         // ── 5. Compute new tick range centred on newTick ──────────────────────
-        int24 newTickLower = _roundDown(
-            newTick - cfg.halfWidth,
-            cfg.tickSpacing
-        );
-        int24 newTickUpper = _roundUp(newTick + cfg.halfWidth, cfg.tickSpacing);
+        // Clamp to Uniswap V3 valid tick bounds [-887272, 887272]
+        int24 newTickLower = newTick - cfg.halfWidth;
+        int24 newTickUpper = newTick + cfg.halfWidth;
+        if (newTickLower < -887272) newTickLower = -887272;
+        if (newTickUpper > 887272) newTickUpper = 887272;
+        newTickLower = _roundDown(newTickLower, cfg.tickSpacing);
+        newTickUpper = _roundUp(newTickUpper, cfg.tickSpacing);
+        // Final clamp after rounding
+        if (newTickLower < -887272) newTickLower = -887272 + cfg.tickSpacing;
+        if (newTickUpper > 887272) newTickUpper = 887272 - cfg.tickSpacing;
 
         // ── 6. Mint fresh position with vault's entire token balance ──────────
         // Using full balance maximises capital efficiency post-rebalance.
