@@ -106,6 +106,16 @@ function _serializePool(pool) {
       lastUpdated:   pool.liveData.lastUpdated,
     } : null,
 
+    lastRebalanceFailure: pool.lastRebalanceFailure ? {
+      newTick:     pool.lastRebalanceFailure.newTick,
+      oldTokenId:  pool.lastRebalanceFailure.oldTokenId,
+      reason:      pool.lastRebalanceFailure.reason,
+      blockNumber: pool.lastRebalanceFailure.blockNumber,
+      timestamp:   pool.lastRebalanceFailure.timestamp,
+      txHash:      pool.lastRebalanceFailure.txHash,
+      timeAgo:     _timeAgo(pool.lastRebalanceFailure.timestamp),
+    } : null,
+
     recentRebalances: (pool.recentRebalances ?? []).map(r => ({
       newTick:     r.newTick,
       oldTokenId:  r.oldTokenId,

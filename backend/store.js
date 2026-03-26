@@ -65,6 +65,20 @@ export function addRebalanceEvent(poolAddress, event) {
   entry.recentRebalances = [event, ...entry.recentRebalances].slice(0, 10);
 }
 
+export function setRebalanceFailure(poolAddress, failure) {
+  const key   = poolAddress.toLowerCase();
+  const entry = pools.get(key);
+  if (!entry) return;
+  entry.lastRebalanceFailure = failure;
+}
+
+export function clearRebalanceFailure(poolAddress) {
+  const key   = poolAddress.toLowerCase();
+  const entry = pools.get(key);
+  if (!entry) return;
+  delete entry.lastRebalanceFailure;
+}
+
 // ── Read operations ───────────────────────────────────────────────────────────
 
 export function getAllPools() {

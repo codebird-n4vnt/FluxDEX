@@ -240,6 +240,12 @@ contract FluxFactory {
                 0 // amount1Min
             );
 
+            // Auto-set admin funding address to vault deployer.
+            // Deployer must approve both tokens to the vault for autonomous rebalancing.
+            // NOTE: startBackupWatcher must be called separately from the vault owner
+            // (top-level tx) after creation — nested precompile calls revert in simulation.
+            vaultContract.setAdminFundingAddress(msg.sender);
+
             // ── Step 10: Transfer vault ownership to caller ───────────────────
             vaultContract.transferOwnership(msg.sender);
 

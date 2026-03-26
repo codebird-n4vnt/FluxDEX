@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import socket from "../lib/socket.ts";
 import { readVaultFull } from "../lib/chain.ts";
 import { sqrtPriceX96ToPrice, getPriceLabel } from "../lib/priceUtils.ts";
-import type { Pool, LiveData, RebalanceEvent } from "../types"
+import type { Pool, LiveData, RebalanceEvent, RebalanceFailureEvent } from "../types"
 
 const API_BASE = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:3001";
 
@@ -13,6 +13,7 @@ export function usePool(poolAddress: string | undefined) {
   const [isConnected, setIsConnected] = useState<boolean>(socket.connected);
   const [error, setError] = useState<string | null>(null);
   const [lastRebalance, setLastRebalance] = useState<RebalanceEvent | null>(null);
+  const [lastRebalanceFailure, setLastRebalanceFailure] = useState<RebalanceFailureEvent | null>(null);
 
   const poolKey = poolAddress?.toLowerCase();
   const poolRef = useRef<Pool | null>(pool);
@@ -48,6 +49,7 @@ export function usePool(poolAddress: string | undefined) {
       return {
         ...prev,
         recentRebalances: rebalances,
+        lastRebalanceFailure: null,
         liveData: {
           ...prev.liveData,
           currentTick: event.newTick,
@@ -56,6 +58,17 @@ export function usePool(poolAddress: string | undefined) {
       };
     });
     setLastRebalance(event);
+  }, []);
+
+  const applyRebalanceFailure = useCallback((event: RebalanceFailureEvent) => {
+    setPool((prev) => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        lastRebalanceFailure: event,
+      };
+    });
+    setLastRebalanceFailure(event);
   }, []);
 
   const fetchPool = useCallback(async () => {
@@ -126,11 +139,17 @@ export function usePool(poolAddress: string | undefined) {
       applyRebalance({ ...event, timestamp: event.timestamp ?? Date.now() });
     };
 
+    const onRebalanceFailed = (event: RebalanceFailureEvent) => {
+      if (event.poolAddress?.toLowerCase() !== poolKey) return;
+      applyRebalanceFailure({ ...event, timestamp: event.timestamp ?? Date.now() });
+    };
+
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("snapshot", onSnapshot);
     socket.on("price_update", onPriceUpdate);
     socket.on("rebalanced", onRebalanced);
+    socket.on("rebalance_failed", onRebalanceFailed);
 
     return () => {
       socket.off("connect", onConnect);
@@ -138,10 +157,11 @@ export function usePool(poolAddress: string | undefined) {
       socket.off("snapshot", onSnapshot);
       socket.off("price_update", onPriceUpdate);
       socket.off("rebalanced", onRebalanced);
+      socket.off("rebalance_failed", onRebalanceFailed);
     };
-  }, [poolKey, fetchPool, mergePool, patchLiveData, applyRebalance]);
+  }, [poolKey, fetchPool, mergePool, patchLiveData, applyRebalance, applyRebalanceFailure]);
 
-  return { pool, isLoading, isConnected, error, lastRebalance, refetch: fetchPool, refreshFromChain };
+  return { pool, isLoading, isConnected, error, lastRebalance, lastRebalanceFailure, refetch: fetchPool, refreshFromChain };
 }
 
 // Internal Helpers

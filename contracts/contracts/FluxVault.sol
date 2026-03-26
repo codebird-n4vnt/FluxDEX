@@ -136,8 +136,17 @@ interface INonfungiblePositionManager {
 /// @notice Minimal ERC-20 interface.
 interface IERC20 {
     function approve(address spender, uint256 amount) external returns (bool);
+    function allowance(
+        address owner,
+        address spender
+    ) external view returns (uint256);
     function balanceOf(address account) external view returns (uint256);
     function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -283,7 +292,11 @@ contract FluxVault {
     /// @notice How many blocks between each BlockTick backup check.
     /// @dev    50 blocks = ~5 seconds on Somnia (10 blocks/sec).
     ///         Reduces STT drain from BlockTick firing every single block.
-    uint256 public constant BACKUP_CHECK_INTERVAL = 50;
+    uint256 public constant BACKUP_CHECK_INTERVAL = 10;
+
+    /// @notice Cooldown after a failed rebalance before BlockTick retries again.
+    /// @dev    Prevents infinite failure loops from draining STT every block.
+    uint256 public constant BACKUP_FAILURE_COOLDOWN = 100;
 
     /// @notice keccak256("BlockTick(uint64)") — Somnia system event topic.
     bytes32 public constant BLOCK_TICK_TOPIC = keccak256("BlockTick(uint64)");
@@ -377,11 +390,22 @@ contract FluxVault {
     /// @notice Last block number at which the backup watcher ran its range check.
     uint256 public lastBackupCheckBlock;
 
+    /// @notice Last block number at which a rebalance failure was recorded.
+    uint256 public lastRebalanceFailureBlock;
+
     // ── Slot 7 ──────────────────────────────────────────────────────────────
     /// @notice Reentrancy lock. 1 = unlocked, 2 = locked.
     /// @dev    Initialized to 1 (not 0) so the first lock costs a warm SSTORE
     ///         (~100 gas) instead of a cold new slot write (~200,100 gas on Somnia).
     uint256 private _locked;
+
+    // ── Slot 9 ─────────────────────────────────────────────────────────────────────
+    /// @notice Address from which the vault pulls tokens during auto-rebalance.
+    /// @dev    Must pre-approve token0 + token1 to this vault (one-time unlimited).
+    ///         Auto-set to vault deployer by FluxFactory. Set to address(0) to disable.
+    address public adminFundingAddress;
+    uint256 public lastMintAmount0;
+    uint256 public lastMintAmount1;
 
     // ── Slot 8 ──────────────────────────────────────────────────────────────
     /// @notice All packed mutable vault config in a single storage slot.
@@ -400,6 +424,9 @@ contract FluxVault {
         uint256 oldTokenId,
         uint256 newTokenId
     );
+
+    /// @notice Emitted when the rebalance mint fails (e.g. insufficient tokens).
+    event RebalanceFailed(int24 newTick, uint256 oldTokenId, string reason);
 
     /// @notice Emitted once after `initializeFirstPosition` succeeds.
     /// @param tokenId      The minted NFT ID.
@@ -483,7 +510,7 @@ contract FluxVault {
         owner = msg.sender;
         pool = _pool;
         npm = _npm;
-
+        adminFundingAddress = msg.sender;
         // Read pool fee once and cache in the packed config slot (avoids a cold
         // external call on every rebalance).
         uint24 _poolFee = IUniswapV3Pool(_pool).fee();
@@ -556,7 +583,12 @@ contract FluxVault {
         );
 
         // ── Mint the initial position ─────────────────────────────────────────
-        (uint256 _tokenId, , , ) = INonfungiblePositionManager(_npm).mint(
+        (
+            uint256 _tokenId,
+            ,
+            uint256 amount0Used,
+            uint256 amount1Used
+        ) = INonfungiblePositionManager(_npm).mint(
             INonfungiblePositionManager.MintParams({
                 token0: token0,
                 token1: token1,
@@ -574,6 +606,8 @@ contract FluxVault {
 
         // ── Write back to storage — batched into two slots ────────────────────
         tokenId = _tokenId; // slot 3
+        lastMintAmount0 = amount0Used;
+        lastMintAmount1 = amount1Used;
 
         cfg.tickLower = _tickLower;
         cfg.tickUpper = _tickUpper;
@@ -710,12 +744,18 @@ contract FluxVault {
             if (newTick >= cfg.tickLower && newTick < cfg.tickUpper) return;
             _rebalance(newTick, cfg);
         } else if (emitter == address(PRECOMPILE)) {
+            uint256 lastFailure = lastRebalanceFailureBlock;
+            if (
+                lastFailure != 0 &&
+                block.number < lastFailure + BACKUP_FAILURE_COOLDOWN
+            ) return;
+
+            uint256 lastCheck = lastBackupCheckBlock;
+            if (block.number < lastCheck + BACKUP_CHECK_INTERVAL) return;
+            lastBackupCheckBlock = block.number;
             // ── Path B: BlockTick system event — backup rebalance check ───────
-            // Interval guard — only run the check every BACKUP_CHECK_INTERVAL blocks.
-            // Prevents STT drain from validator gas fees on every single block.
-            uint256 lastCheck = lastBackupCheckBlock; // 1 cold SLOAD
-            if (block.number - lastCheck < BACKUP_CHECK_INTERVAL) return;
-            lastBackupCheckBlock = block.number; // 1 SSTORE
+            // BlockTick fires every block on Somnia (~100ms) — check on every invocation.
+            // Backup checks are throttled to avoid infinite retry loops draining STT.
 
             (, int24 currentTick, , , , , ) = IUniswapV3Pool(pool).slot0();
             if (currentTick >= cfg.tickLower && currentTick < cfg.tickUpper)
@@ -757,80 +797,377 @@ contract FluxVault {
                 : twapTick - newTick;
             if (deviation > MAX_TICK_DEVIATION) return;
         }
-        // ── 1. Read current position liquidity ────────────────────────────────
-        // `positions()` is a cold external call (~1M gas account access on Somnia).
-        // We only fetch the `liquidity` field we need.
-        (, , , , , , , uint128 liquidity, , , , ) = INonfungiblePositionManager(
-            _npm
-        ).positions(_tokenId);
+        // ── 1–4. Remove old position (ONLY if one exists) ────────────────────
+        // When mint() previously failed, tokenId is set to 0 as a sentinel.
+        // If tokenId==0 we have no active position to burn — skip to admin pull.
+        if (_tokenId > 0) {
+            // ── 1. Read current position liquidity ────────────────────────────
+            uint128 liquidity;
+            try INonfungiblePositionManager(_npm).positions(_tokenId) returns (
+                uint96,
+                address,
+                address,
+                address,
+                uint24,
+                int24,
+                int24,
+                uint128 _liquidity,
+                uint256,
+                uint256,
+                uint128,
+                uint128
+            ) {
+                liquidity = _liquidity;
+            } catch Error(string memory reason) {
+                _recordRebalanceFailure(newTick, _tokenId, reason);
+                return;
+            } catch {
+                _recordRebalanceFailure(newTick, _tokenId, "positions failed");
+                return;
+            }
 
-        // ── 2. Remove all liquidity ───────────────────────────────────────────
-        if (liquidity > 0) {
-            INonfungiblePositionManager(_npm).decreaseLiquidity(
-                INonfungiblePositionManager.DecreaseLiquidityParams({
-                    tokenId: _tokenId,
-                    liquidity: liquidity,
-                    amount0Min: 0, // no slippage protection — testnet
-                    amount1Min: 0,
-                    deadline: block.timestamp + 15 minutes
-                })
-            );
+            // ── 2. Remove all liquidity ───────────────────────────────────────
+            if (liquidity > 0) {
+                try
+                    INonfungiblePositionManager(_npm).decreaseLiquidity(
+                        INonfungiblePositionManager.DecreaseLiquidityParams({
+                            tokenId: _tokenId,
+                            liquidity: liquidity,
+                            amount0Min: 0, // no slippage protection — testnet
+                            amount1Min: 0,
+                            deadline: block.timestamp + 15 minutes
+                        })
+                    )
+                returns (uint256, uint256) {} catch Error(string memory reason) {
+                    _recordRebalanceFailure(newTick, _tokenId, reason);
+                    return;
+                } catch {
+                    _recordRebalanceFailure(
+                        newTick,
+                        _tokenId,
+                        "decreaseLiquidity failed"
+                    );
+                    return;
+                }
+            }
+
+            // ── 3. Collect all tokens + fees to vault ────────────────────────
+            try
+                INonfungiblePositionManager(_npm).collect(
+                    INonfungiblePositionManager.CollectParams({
+                        tokenId: _tokenId,
+                        recipient: address(this),
+                        amount0Max: type(uint128).max,
+                        amount1Max: type(uint128).max
+                    })
+                )
+            returns (uint256, uint256) {} catch Error(string memory reason) {
+                _recordRebalanceFailure(newTick, _tokenId, reason);
+                return;
+            } catch {
+                _recordRebalanceFailure(newTick, _tokenId, "collect failed");
+                return;
+            }
+
+            // ── 4. Burn the empty NFT ─────────────────────────────────────────
+            try INonfungiblePositionManager(_npm).burn(_tokenId) {
+                // no-op
+            } catch Error(string memory reason) {
+                _recordRebalanceFailure(newTick, _tokenId, reason);
+                return;
+            } catch {
+                _recordRebalanceFailure(newTick, _tokenId, "burn failed");
+                return;
+            }
         }
-
-        // ── 3. Collect all tokens + fees to vault ─────────────────────────────
-        INonfungiblePositionManager(_npm).collect(
-            INonfungiblePositionManager.CollectParams({
-                tokenId: _tokenId,
-                recipient: address(this),
-                amount0Max: type(uint128).max,
-                amount1Max: type(uint128).max
-            })
-        );
-
-        // ── 4. Burn the empty NFT ─────────────────────────────────────────────
-        INonfungiblePositionManager(_npm).burn(_tokenId);
-
-        // ── 5. Compute new tick range centred on newTick ──────────────────────
-        // Clamp to Uniswap V3 valid tick bounds [-887272, 887272]
-        int24 newTickLower = newTick - cfg.halfWidth;
-        int24 newTickUpper = newTick + cfg.halfWidth;
-        if (newTickLower < -887272) newTickLower = -887272;
-        if (newTickUpper > 887272) newTickUpper = 887272;
-        newTickLower = _roundDown(newTickLower, cfg.tickSpacing);
-        newTickUpper = _roundUp(newTickUpper, cfg.tickSpacing);
-        // Final clamp after rounding
-        if (newTickLower < -887272) newTickLower = -887272 + cfg.tickSpacing;
-        if (newTickUpper > 887272) newTickUpper = 887272 - cfg.tickSpacing;
-
-        // ── 6. Mint fresh position with vault's entire token balance ──────────
-        // Using full balance maximises capital efficiency post-rebalance.
+        // ── 5. Read vault token balances after collecting old position ───────────
         uint256 bal0 = IERC20(token0).balanceOf(address(this));
         uint256 bal1 = IERC20(token1).balanceOf(address(this));
+        uint256 target0 = lastMintAmount0;
+        uint256 target1 = lastMintAmount1;
 
-        (uint256 newTokenId, , , ) = INonfungiblePositionManager(_npm).mint(
-            INonfungiblePositionManager.MintParams({
-                token0: token0,
-                token1: token1,
-                fee: cfg.poolFee,
-                tickLower: newTickLower,
-                tickUpper: newTickUpper,
-                amount0Desired: bal0,
-                amount1Desired: bal1,
-                amount0Min: 0, // testnet — no sandwich risk
-                amount1Min: 0,
-                recipient: address(this),
-                deadline: block.timestamp + 15 minutes
-            })
+        // ── 6. Admin pull-funding: top up whichever token is short ──────────────
+        // The vault admin pre-approves both pool tokens once (unlimited allowance).
+        // On every rebalance, the vault pulls only the deficit from the admin's
+        // wallet — enough to make it proportional, capped by admin balance/allowance.
+        address _admin = adminFundingAddress;
+        if (_admin != address(0)) {
+            // If the vault is completely empty, bootstrap it from the last
+            // successful mint amounts so tokenId=0 can recover autonomously.
+            if (bal0 == 0 && bal1 == 0) {
+                if (target0 > 0) {
+                    uint256 adminBal0 = IERC20(token0).balanceOf(_admin);
+                    uint256 adminAllow0 = IERC20(token0).allowance(
+                        _admin,
+                        address(this)
+                    );
+                    uint256 canPull0 = adminBal0 < adminAllow0
+                        ? adminBal0
+                        : adminAllow0;
+                    if (canPull0 > 0) {
+                        uint256 pullAmt0 = canPull0 < target0
+                            ? canPull0
+                            : target0;
+                        try
+                            IERC20(token0).transferFrom(
+                                _admin,
+                                address(this),
+                                pullAmt0
+                            )
+                        returns (bool) {} catch {}
+                    }
+                }
+
+                if (target1 > 0) {
+                    uint256 adminBal1 = IERC20(token1).balanceOf(_admin);
+                    uint256 adminAllow1 = IERC20(token1).allowance(
+                        _admin,
+                        address(this)
+                    );
+                    uint256 canPull1 = adminBal1 < adminAllow1
+                        ? adminBal1
+                        : adminAllow1;
+                    if (canPull1 > 0) {
+                        uint256 pullAmt1 = canPull1 < target1
+                            ? canPull1
+                            : target1;
+                        try
+                            IERC20(token1).transferFrom(
+                                _admin,
+                                address(this),
+                                pullAmt1
+                            )
+                        returns (bool) {} catch {}
+                    }
+                }
+
+                bal0 = IERC20(token0).balanceOf(address(this));
+                bal1 = IERC20(token1).balanceOf(address(this));
+            }
+
+            // If we have a historical two-sided mint, use that ratio as the target.
+            // This keeps funding correct for pairs with different decimals / prices.
+            if (target0 > 0 && target1 > 0) {
+                if (bal0 > 0 && bal1 * target0 < bal0 * target1) {
+                    uint256 desired1 = (bal0 * target1) / target0;
+                    uint256 needed1 = desired1 > bal1 ? desired1 - bal1 : 0;
+                    if (needed1 > 0) {
+                        uint256 adminBal1 = IERC20(token1).balanceOf(_admin);
+                        uint256 adminAllow1 = IERC20(token1).allowance(
+                            _admin,
+                            address(this)
+                        );
+                        uint256 canPull1 = adminBal1 < adminAllow1
+                            ? adminBal1
+                            : adminAllow1;
+                        if (canPull1 > 0) {
+                            uint256 pullAmt1 = canPull1 < needed1
+                                ? canPull1
+                                : needed1;
+                            try
+                                IERC20(token1).transferFrom(
+                                    _admin,
+                                    address(this),
+                                    pullAmt1
+                                )
+                            returns (bool) {} catch {}
+                            bal1 = IERC20(token1).balanceOf(address(this));
+                        }
+                    }
+                }
+                if (bal1 > 0 && bal0 * target1 < bal1 * target0) {
+                    uint256 desired0 = (bal1 * target0) / target1;
+                    uint256 needed0 = desired0 > bal0 ? desired0 - bal0 : 0;
+                    if (needed0 > 0) {
+                        uint256 adminBal0 = IERC20(token0).balanceOf(_admin);
+                        uint256 adminAllow0 = IERC20(token0).allowance(
+                            _admin,
+                            address(this)
+                        );
+                        uint256 canPull0 = adminBal0 < adminAllow0
+                            ? adminBal0
+                            : adminAllow0;
+                        if (canPull0 > 0) {
+                            uint256 pullAmt0 = canPull0 < needed0
+                                ? canPull0
+                                : needed0;
+                            try
+                                IERC20(token0).transferFrom(
+                                    _admin,
+                                    address(this),
+                                    pullAmt0
+                                )
+                            returns (bool) {} catch {}
+                            bal0 = IERC20(token0).balanceOf(address(this));
+                        }
+                    }
+                }
+            } else {
+                // Fallback for vaults that only have one-sided historical data.
+                if (bal1 == 0 || (bal0 > 0 && bal1 * 20 < bal0)) {
+                    uint256 needed1 = bal0 > bal1 ? bal0 - bal1 : 0;
+                    if (needed1 > 0) {
+                        uint256 adminBal1 = IERC20(token1).balanceOf(_admin);
+                        uint256 adminAllow1 = IERC20(token1).allowance(
+                            _admin,
+                            address(this)
+                        );
+                        uint256 canPull1 = adminBal1 < adminAllow1
+                            ? adminBal1
+                            : adminAllow1;
+                        if (canPull1 > 0) {
+                            uint256 pullAmt1 = canPull1 < needed1
+                                ? canPull1
+                                : needed1;
+                            try
+                                IERC20(token1).transferFrom(
+                                    _admin,
+                                    address(this),
+                                    pullAmt1
+                                )
+                            returns (bool) {} catch {}
+                            bal1 = IERC20(token1).balanceOf(address(this));
+                        }
+                    }
+                }
+                if (bal0 == 0 || (bal1 > 0 && bal0 * 20 < bal1)) {
+                    uint256 needed0 = bal1 > bal0 ? bal1 - bal0 : 0;
+                    if (needed0 > 0) {
+                        uint256 adminBal0 = IERC20(token0).balanceOf(_admin);
+                        uint256 adminAllow0 = IERC20(token0).allowance(
+                            _admin,
+                            address(this)
+                        );
+                        uint256 canPull0 = adminBal0 < adminAllow0
+                            ? adminBal0
+                            : adminAllow0;
+                        if (canPull0 > 0) {
+                            uint256 pullAmt0 = canPull0 < needed0
+                                ? canPull0
+                                : needed0;
+                            try
+                                IERC20(token0).transferFrom(
+                                    _admin,
+                                    address(this),
+                                    pullAmt0
+                                )
+                            returns (bool) {} catch {}
+                            bal0 = IERC20(token0).balanceOf(address(this));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Safety guard: if vault has zero of BOTH tokens, nothing to mint ────
+        if (bal0 == 0 && bal1 == 0) {
+            _recordRebalanceFailure(newTick, _tokenId, "zero balances");
+            return;
+        }
+
+        // ── 7. Compute new tick range ─────────────────────────────────────────────
+        // Center on newTick when admin funded both sides.
+        // Fall back to one-sided anchor if vault still lacks one token after pull.
+        bool onlyToken0;
+        bool onlyToken1;
+        if (target0 > 0 && target1 > 0) {
+            onlyToken0 =
+                (bal0 > 0) &&
+                (bal1 == 0 || bal1 * target0 * 20 < bal0 * target1);
+            onlyToken1 =
+                (bal1 > 0) &&
+                (bal0 == 0 || bal0 * target1 * 20 < bal1 * target0);
+        } else {
+            onlyToken0 = (bal0 > 0) && (bal1 == 0 || bal1 * 20 < bal0);
+            onlyToken1 = (bal1 > 0) && (bal0 == 0 || bal0 * 20 < bal1);
+        }
+        int24 anchorTick = newTick;
+        if (onlyToken0) {
+            // Token0-only liquidity must be placed ABOVE the current price.
+            anchorTick = newTick + cfg.halfWidth;
+        } else if (onlyToken1) {
+            // Token1-only liquidity must be placed BELOW the current price.
+            anchorTick = newTick - cfg.halfWidth;
+        }
+        if (anchorTick < -887272 + cfg.halfWidth)
+            anchorTick = -887272 + cfg.halfWidth;
+        if (anchorTick > 887272 - cfg.halfWidth)
+            anchorTick = 887272 - cfg.halfWidth;
+
+        int24 newTickLower = _roundDown(
+            anchorTick - cfg.halfWidth,
+            cfg.tickSpacing
+        );
+        int24 newTickUpper = _roundUp(
+            anchorTick + cfg.halfWidth,
+            cfg.tickSpacing
         );
 
-        // ── 7. Write back to storage — all in one pass ────────────────────────
+        if (newTickLower < -887272)
+            newTickLower = _roundUp(-887272, cfg.tickSpacing);
+        if (newTickUpper > 887272)
+            newTickUpper = _roundDown(887272, cfg.tickSpacing);
+        if (newTickLower >= newTickUpper)
+            newTickLower = newTickUpper - cfg.tickSpacing;
+
+        // ── 8. Mint new position — wrapped in try/catch so rebalance is fault-tolerant ─
+        uint256 newTokenId;
+        uint256 amount0Used;
+        uint256 amount1Used;
+        try
+            INonfungiblePositionManager(_npm).mint(
+                INonfungiblePositionManager.MintParams({
+                    token0: token0,
+                    token1: token1,
+                    fee: cfg.poolFee,
+                    tickLower: newTickLower,
+                    tickUpper: newTickUpper,
+                    amount0Desired: bal0,
+                    amount1Desired: bal1,
+                    amount0Min: 0, // testnet — no sandwich risk
+                    amount1Min: 0,
+                    recipient: address(this),
+                    deadline: block.timestamp + 15 minutes
+                })
+            )
+        returns (
+            uint256 _newTokenId,
+            uint128,
+            uint256 _amount0Used,
+            uint256 _amount1Used
+        ) {
+            newTokenId = _newTokenId;
+            amount0Used = _amount0Used;
+            amount1Used = _amount1Used;
+        } catch Error(string memory reason) {
+            tokenId = 0; // sentinel: no active position — skip burn on next invocation
+            _recordRebalanceFailure(newTick, _tokenId, reason);
+            return;
+        } catch {
+            tokenId = 0; // sentinel: no active position — skip burn on next invocation
+            _recordRebalanceFailure(newTick, _tokenId, "mint failed");
+            return;
+        }
+        // ── 9. Write back to storage — all in one pass ────────────────────────
         tokenId = newTokenId; // slot 3
+        lastMintAmount0 = amount0Used;
+        lastMintAmount1 = amount1Used;
+        lastRebalanceFailureBlock = 0;
 
         cfg.tickLower = newTickLower;
         cfg.tickUpper = newTickUpper;
         config = cfg; // single SSTORE for entire packed slot (slot 5)
 
         emit Rebalanced(newTick, _tokenId, newTokenId);
+    }
+
+    function _recordRebalanceFailure(
+        int24 newTick,
+        uint256 oldTokenId,
+        string memory reason
+    ) internal {
+        lastRebalanceFailureBlock = block.number;
+        emit RebalanceFailed(newTick, oldTokenId, reason);
     }
 
     function _getTWAPTick(
@@ -857,6 +1194,26 @@ contract FluxVault {
     // ═══════════════════════════════════════════════════════════════════════════
     //  ADMIN FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Sets the address from which the vault pulls tokens during auto-rebalance.
+    /// @dev    The address must pre-approve both pool tokens to this vault (one-time).
+    ///         FluxFactory sets this to msg.sender automatically on vault creation.
+    ///         Set to address(0) to disable admin pull-funding.
+    function setAdminFundingAddress(address _admin) external onlyOwner {
+        adminFundingAddress = _admin;
+    }
+
+    /// @notice Forces an immediate rebalance using the pool's current tick.
+    /// @dev    Owner escape hatch for demos and recovery if Reactivity is delayed.
+    ///         Unlike `onEvent`, this bypasses the out-of-range guard and recenters
+    ///         the position around the latest on-chain pool tick right away.
+    function manualRebalance() external onlyOwner nonReentrant {
+        VaultConfig memory cfg = config;
+        if (!cfg.initialized) revert NotInitialized();
+
+        (, int24 currentTick, , , , , ) = IUniswapV3Pool(pool).slot0();
+        _rebalance(currentTick, cfg);
+    }
 
     /// @notice Cancels the active Reactivity subscription.
     /// @dev    Does NOT close the LP position. Use `initializeFirstPosition` flow to

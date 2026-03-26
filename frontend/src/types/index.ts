@@ -35,6 +35,17 @@ export interface RebalanceEvent {
   vaultAddress?: string;
 }
 
+export interface RebalanceFailureEvent {
+  newTick: number;
+  oldTokenId: number | string;
+  reason: string;
+  txHash?: string;
+  blockNumber: number;
+  timestamp: number;
+  poolAddress?: string;
+  vaultAddress?: string;
+}
+
 export interface Pool {
   poolAddress: string;
   vaultAddress?: string;
@@ -44,5 +55,6 @@ export interface Pool {
   deployer?: string;
   createdAt?: number;
   liveData?: LiveData;
+  lastRebalanceFailure?: RebalanceFailureEvent | null;
   recentRebalances?: RebalanceEvent[];
 }

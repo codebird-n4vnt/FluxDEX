@@ -1,6 +1,6 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi'
-import { parseUnits, formatUnits } from 'viem'
+import { parseUnits, formatUnits, maxUint256 } from 'viem'
 import { useState, useEffect, useMemo } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import toast from 'react-hot-toast'
@@ -19,6 +19,9 @@ import {
 
 const ROUTER_ADDRESS = (import.meta.env.VITE_ROUTER_ADDRESS ?? '') as `0x${string}`
 const EXPLORER_URL = 'https://shannon-explorer.somnia.network'
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+const SWAP_WATCHER_GAS = 6000000n
+const BLOCKTICK_WATCHER_GAS = 6000000n
 
 export default function VaultDetailPage() {
   const { poolAddress } = useParams<{ poolAddress: string }>()
@@ -26,7 +29,7 @@ export default function VaultDetailPage() {
   const { address: userAddress } = useAccount()
   const queryClient = useQueryClient()
 
-  const { pool, isLoading, lastRebalance, refreshFromChain } = usePool(poolAddress)
+  const { pool, isLoading, lastRebalance, lastRebalanceFailure, refreshFromChain } = usePool(poolAddress)
 
   const vaultAddress = pool?.vaultAddress as `0x${string}` | undefined
   const poolAddr = pool?.poolAddress as `0x${string}` | undefined
@@ -77,6 +80,8 @@ export default function VaultDetailPage() {
   const isOwner = userAddress && vaultOwner && userAddress.toLowerCase() === (vaultOwner as string).toLowerCase()
   const sttBalance = sttBalanceRaw ? parseFloat(formatUnits(sttBalanceRaw as bigint, 18)) : 0
   const liveCurrentTick = slot0Data ? Number((slot0Data as any)[1]) : pool?.liveData?.currentTick
+  const tokenIdValue = currentTokenId != null ? Number(currentTokenId as bigint) : null
+  const hasActivePosition = tokenIdValue !== null && tokenIdValue > 0
 
   // Compute prices from ticks
   const priceInfo = useMemo(() => {
@@ -134,7 +139,7 @@ export default function VaultDetailPage() {
 
   // Approve for swap
   const { writeContract: approveSwap, data: approveSwapHash, reset: resetApprove } = useWriteContract()
-  const { isLoading: isApproveSwapLoading, isSuccess: isApproveSwapSuccess } = useWaitForTransactionReceipt({ hash: approveSwapHash })
+  const { isLoading: isApproveSwapLoading } = useWaitForTransactionReceipt({ hash: approveSwapHash })
 
   // Execute swap
   const { writeContract: executeSwap, data: swapHash, reset: resetSwap } = useWriteContract()
@@ -152,44 +157,135 @@ export default function VaultDetailPage() {
     query: { enabled: !!inputTokenAddr && !!userAddress, refetchInterval: 10000 },
   })
 
+  // Read actual on-chain router allowance — more reliable than isApproveSwapSuccess
+  // which resets on direction change or page refresh.
+  const { data: routerAllowanceRaw, refetch: refetchRouterAllowance } = useReadContract({
+    address: inputTokenAddr,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: userAddress ? [userAddress, ROUTER_ADDRESS] : undefined,
+    query: { enabled: !!inputTokenAddr && !!userAddress, refetchInterval: 3000 },
+  })
+
   const userBalance = userInputBalance != null && inputTokenDecimals != null
     ? parseFloat(formatUnits(userInputBalance as bigint, inputTokenDecimals))
     : null
 
   const insufficientBalance = userBalance !== null && parseFloat(swapAmount || '0') > userBalance
 
-  // Reset approval state when direction changes
+  // Swap button is enabled when on-chain allowance >= swap amount
+  const swapAmountParsed = inputTokenDecimals != null && swapAmount
+    ? parseUnits(swapAmount, inputTokenDecimals)
+    : 0n
+  const hasRouterAllowance = routerAllowanceRaw != null && (routerAllowanceRaw as bigint) >= swapAmountParsed
+
+  // Reset approval state when direction changes and re-fetch allowance
   useEffect(() => {
     resetApprove()
     resetSwap()
-  }, [swapDirection])
+    refetchRouterAllowance()
+  }, [swapDirection, refetchRouterAllowance])
 
   // Auto-refresh after swap confirms — show new tick position immediately
   useEffect(() => {
     if (isSwapSuccess) {
       queryClient.invalidateQueries()
       refreshFromChain()
+      refetchRouterAllowance()
       // Poll rapidly for 30s to catch reactivity rebalance
       const interval = setInterval(refreshFromChain, 2000)
       const timeout = setTimeout(() => clearInterval(interval), 30000)
       return () => { clearInterval(interval); clearTimeout(timeout) }
     }
-  }, [isSwapSuccess, queryClient, refreshFromChain])
+  }, [isSwapSuccess, queryClient, refreshFromChain, refetchRouterAllowance])
 
   // ── Admin actions ──
+  const { writeContract: startSwapWatch, data: startSwapWatchHash } = useWriteContract()
+  const { isLoading: isStartSwapWatchLoading, isSuccess: isStartSwapWatchSuccess } = useWaitForTransactionReceipt({ hash: startSwapWatchHash })
+
+  const { writeContract: stopSwapWatch, data: stopSwapWatchHash } = useWriteContract()
+  const { isLoading: isStopSwapWatchLoading, isSuccess: isStopSwapWatchSuccess } = useWaitForTransactionReceipt({ hash: stopSwapWatchHash })
+
   const { writeContract: startWatch, data: startWatchHash } = useWriteContract()
   const { isLoading: isStartWatchLoading, isSuccess: isStartWatchSuccess } = useWaitForTransactionReceipt({ hash: startWatchHash })
 
   const { writeContract: stopWatch, data: stopWatchHash } = useWriteContract()
   const { isLoading: isStopWatchLoading, isSuccess: isStopWatchSuccess } = useWaitForTransactionReceipt({ hash: stopWatchHash })
 
+  const { writeContract: manualRebalance, data: manualRebalanceHash } = useWriteContract()
+  const { isLoading: isManualRebalanceLoading, isSuccess: isManualRebalanceSuccess } = useWaitForTransactionReceipt({ hash: manualRebalanceHash })
+
+
   // Invalidate all queries when admin txs confirm — triggers immediate re-read of subscriptionId, config, etc.
   useEffect(() => {
-    if (isStartWatchSuccess || isStopWatchSuccess) {
+    if (
+      isStartSwapWatchSuccess ||
+      isStopSwapWatchSuccess ||
+      isStartWatchSuccess ||
+      isStopWatchSuccess ||
+      isManualRebalanceSuccess
+    ) {
       queryClient.invalidateQueries()
       refreshFromChain()
     }
-  }, [isStartWatchSuccess, isStopWatchSuccess, queryClient, refreshFromChain])
+  }, [
+    isStartSwapWatchSuccess,
+    isStopSwapWatchSuccess,
+    isStartWatchSuccess,
+    isStopWatchSuccess,
+    isManualRebalanceSuccess,
+    queryClient,
+    refreshFromChain,
+  ])
+
+  // ── Admin Funding Address + Allowance reads ──
+  const { data: adminFundingAddress } = useReadContract({
+    address: vaultAddress,
+    abi: VAULT_ABI,
+    functionName: 'adminFundingAddress',
+    query: { enabled: !!vaultAddress, refetchInterval: 10000 },
+  })
+  const fundingAddress = adminFundingAddress as `0x${string}` | undefined
+  const hasFundingAddress = !!fundingAddress && fundingAddress !== ZERO_ADDRESS
+  const fundingWalletConnected = !hasFundingAddress || !userAddress
+    ? true
+    : userAddress.toLowerCase() === fundingAddress.toLowerCase()
+  const token0Addr = pool?.token0?.address as `0x${string}` | undefined
+  const token1Addr = pool?.token1?.address as `0x${string}` | undefined
+  const { data: allowance0, refetch: refetchAllowance0 } = useReadContract({
+    address: token0Addr,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: hasFundingAddress && vaultAddress ? [fundingAddress, vaultAddress] : undefined,
+    query: { enabled: !!token0Addr && hasFundingAddress && !!vaultAddress, refetchInterval: 5000 },
+  })
+  const { data: allowance1, refetch: refetchAllowance1 } = useReadContract({
+    address: token1Addr,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: hasFundingAddress && vaultAddress ? [fundingAddress, vaultAddress] : undefined,
+    query: { enabled: !!token1Addr && hasFundingAddress && !!vaultAddress, refetchInterval: 5000 },
+  })
+  const { writeContract: approveToken0, data: approveToken0Hash } = useWriteContract()
+  const { writeContract: approveToken1, data: approveToken1Hash } = useWriteContract()
+  const { isLoading: isApproveToken0Loading, isSuccess: isApproveToken0Success } = useWaitForTransactionReceipt({ hash: approveToken0Hash })
+  const { isLoading: isApproveToken1Loading, isSuccess: isApproveToken1Success } = useWaitForTransactionReceipt({ hash: approveToken1Hash })
+  const isApproved0 = allowance0 != null && (allowance0 as bigint) > 0n
+  const isApproved1 = allowance1 != null && (allowance1 as bigint) > 0n
+
+  useEffect(() => {
+    if (isApproveToken0Success) {
+      toast.success('Funding token 0 approved on-chain')
+      refetchAllowance0()
+    }
+  }, [isApproveToken0Success, refetchAllowance0])
+
+  useEffect(() => {
+    if (isApproveToken1Success) {
+      toast.success('Funding token 1 approved on-chain')
+      refetchAllowance1()
+    }
+  }, [isApproveToken1Success, refetchAllowance1])
 
   // Rebalance flash effect
   const [showFlash, setShowFlash] = useState(false)
@@ -202,6 +298,12 @@ export default function VaultDetailPage() {
       return () => clearTimeout(timer)
     }
   }, [lastRebalance])
+
+  useEffect(() => {
+    if (lastRebalanceFailure) {
+      toast.error(`Rebalance failed: ${lastRebalanceFailure.reason}`)
+    }
+  }, [lastRebalanceFailure])
 
   const handleApproveAndSwap = () => {
     if (!pool?.token0 || !pool?.token1) return
@@ -241,20 +343,45 @@ export default function VaultDetailPage() {
         sqrtPriceLimitX96: 0n,
       }],
     }, {
-      onSuccess: () => toast.success('🐋 Whale swap submitted! Watch for reactivity...'),
+      onSuccess: () => toast.success('Swap submitted! Watch for reactivity...'),
       onError: (err) => toast.error(`Swap failed: ${err.message.slice(0, 80)}`),
     })
   }
 
   const handleStartWatching = () => {
     if (!vaultAddress) return
-    startWatch({
+    startSwapWatch({
       address: vaultAddress,
       abi: VAULT_ABI,
       functionName: 'startWatching',
-      args: [3000000n],
+      args: [SWAP_WATCHER_GAS],
     }, {
-      onSuccess: () => toast.success('🛡️ Reactivity subscription started'),
+      onSuccess: () => toast.success('Swap watcher submitted'),
+      onError: (err) => toast.error(`Failed: ${err.message.slice(0, 80)}`),
+    })
+  }
+
+  const handleStopSwapWatching = () => {
+    if (!vaultAddress) return
+    stopSwapWatch({
+      address: vaultAddress,
+      abi: VAULT_ABI,
+      functionName: 'stopWatching',
+    }, {
+      onSuccess: () => toast.success('Swap watcher stopped'),
+      onError: (err) => toast.error(`Failed: ${err.message.slice(0, 80)}`),
+    })
+  }
+
+  const handleStartBackupWatching = () => {
+    if (!vaultAddress) return
+    startWatch({
+      address: vaultAddress,
+      abi: VAULT_ABI,
+      functionName: 'startBackupWatcher',
+      args: [BLOCKTICK_WATCHER_GAS],
+    }, {
+      onSuccess: () => toast.success('BlockTick watcher submitted'),
       onError: (err) => toast.error(`Failed: ${err.message.slice(0, 80)}`),
     })
   }
@@ -264,10 +391,48 @@ export default function VaultDetailPage() {
     stopWatch({
       address: vaultAddress,
       abi: VAULT_ABI,
-      functionName: 'stopWatching',
+      functionName: 'stopBackupWatcher',
     }, {
-      onSuccess: () => toast.success('Reactivity subscription stopped'),
+      onSuccess: () => toast.success('BlockTick watcher stopped'),
       onError: (err) => toast.error(`Failed: ${err.message.slice(0, 80)}`),
+    })
+  }
+
+  const handleManualRebalance = () => {
+    if (!vaultAddress) return
+    manualRebalance({
+      address: vaultAddress,
+      abi: VAULT_ABI,
+      functionName: 'manualRebalance',
+    }, {
+      onSuccess: () => toast.success('Manual rebalance submitted'),
+      onError: (err) => toast.error(`Manual rebalance failed: ${err.message.slice(0, 80)}`),
+    })
+  }
+
+  const handleApproveFundingToken0 = () => {
+    if (!token0Addr || !vaultAddress) return
+    approveToken0({
+      address: token0Addr,
+      abi: ERC20_ABI,
+      functionName: 'approve',
+      args: [vaultAddress, maxUint256],
+    }, {
+      onSuccess: () => toast.success('Approve token0 submitted'),
+      onError: (err) => toast.error(`Approval failed: ${err.message.slice(0, 80)}`),
+    })
+  }
+
+  const handleApproveFundingToken1 = () => {
+    if (!token1Addr || !vaultAddress) return
+    approveToken1({
+      address: token1Addr,
+      abi: ERC20_ABI,
+      functionName: 'approve',
+      args: [vaultAddress, maxUint256],
+    }, {
+      onSuccess: () => toast.success('Approve token1 submitted'),
+      onError: (err) => toast.error(`Approval failed: ${err.message.slice(0, 80)}`),
     })
   }
 
@@ -280,7 +445,9 @@ export default function VaultDetailPage() {
     )
   }
 
-  const watching = pool?.liveData?.watching ?? false
+  const primaryWatching = pool?.liveData?.watching ?? false
+  const backupWatching = backupSubId != null && (backupSubId as bigint) > 0n
+  const watching = primaryWatching || backupWatching
   const initialized = pool?.liveData?.initialized ?? false
   const status = watching ? 'watching' : initialized ? 'unprotected' : 'initializing'
 
@@ -317,7 +484,7 @@ export default function VaultDetailPage() {
       </div>
 
       {/* ── Health Warnings ──────────────────────────────────────── */}
-      {(sttLow || inRange === false) && (
+      {(sttLow || inRange === false || (!hasActivePosition && tokenIdValue === 0) || !!pool?.lastRebalanceFailure) && (
         <div className="space-y-2">
           {sttLow && (
             <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-[var(--color-status-danger)]/10 border border-[var(--color-status-danger)]/20 text-sm">
@@ -338,6 +505,28 @@ export default function VaultDetailPage() {
                 <p className="text-[var(--color-text-secondary)] mt-0.5">
                   Current tick ({liveCurrentTick?.toLocaleString()}) is outside bounds [{pool?.liveData?.tickLower?.toLocaleString()}, {pool?.liveData?.tickUpper?.toLocaleString()}].
                   {watching ? ' Reactivity is active — rebalance should trigger on next swap.' : ' Reactivity is NOT active — start watching to enable auto-rebalance.'}
+                </p>
+              </div>
+            </div>
+          )}
+          {!hasActivePosition && tokenIdValue === 0 && (
+            <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-[var(--color-status-danger)]/10 border border-[var(--color-status-danger)]/20 text-sm">
+              <AlertTriangle className="w-5 h-5 text-[var(--color-status-danger)] shrink-0" />
+              <div>
+                <p className="font-semibold text-[var(--color-status-danger)]">No Active LP Position</p>
+                <p className="text-[var(--color-text-secondary)] mt-0.5">
+                  This vault currently has tokenId 0, so there is no active LP NFT in the pool right now.
+                </p>
+              </div>
+            </div>
+          )}
+          {pool?.lastRebalanceFailure && (
+            <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-[var(--color-status-danger)]/10 border border-[var(--color-status-danger)]/20 text-sm">
+              <AlertTriangle className="w-5 h-5 text-[var(--color-status-danger)] shrink-0" />
+              <div>
+                <p className="font-semibold text-[var(--color-status-danger)]">Latest Rebalance Failed</p>
+                <p className="text-[var(--color-text-secondary)] mt-0.5">
+                  Reason: {pool.lastRebalanceFailure.reason}. Tick {pool.lastRebalanceFailure.newTick.toLocaleString()}, previous NFT #{pool.lastRebalanceFailure.oldTokenId?.toString()}.
                 </p>
               </div>
             </div>
@@ -396,13 +585,13 @@ export default function VaultDetailPage() {
             <div className="flex items-center gap-2 text-xs">
               <span className={`w-2 h-2 rounded-full ${pool0Empty ? 'bg-[var(--color-status-danger)]' : 'bg-[var(--color-neon-green)]'}`} />
               <span className="text-[var(--color-text-tertiary)]">
-                Pool {pool?.token0?.symbol}: {poolBal0 !== null ? (pool0Empty ? '⚠ Empty' : parseFloat(pool.liveData?.poolBalance0 ?? '0').toFixed(4)) : '—'}
+                Pool {pool?.token0?.symbol}: {poolBal0 !== null ? (pool0Empty ? '⚠ Empty' : parseFloat(pool?.liveData?.poolBalance0 ?? '0').toFixed(4)) : '—'}
               </span>
             </div>
             <div className="flex items-center gap-2 text-xs">
               <span className={`w-2 h-2 rounded-full ${pool1Empty ? 'bg-[var(--color-status-danger)]' : 'bg-[var(--color-neon-green)]'}`} />
               <span className="text-[var(--color-text-tertiary)]">
-                Pool {pool?.token1?.symbol}: {poolBal1 !== null ? (pool1Empty ? '⚠ Empty' : parseFloat(pool.liveData?.poolBalance1 ?? '0').toFixed(4)) : '—'}
+                Pool {pool?.token1?.symbol}: {poolBal1 !== null ? (pool1Empty ? '⚠ Empty' : parseFloat(pool?.liveData?.poolBalance1 ?? '0').toFixed(4)) : '—'}
               </span>
             </div>
           </div>
@@ -480,19 +669,19 @@ export default function VaultDetailPage() {
           <div className="flex gap-2">
             <button
               onClick={handleApproveAndSwap}
-              disabled={isApproveSwapLoading || isApproveSwapSuccess || insufficientBalance || !userAddress}
+              disabled={isApproveSwapLoading || hasRouterAllowance || insufficientBalance || !userAddress}
               className="flex-1 py-3 rounded-xl bg-[var(--color-neon-blue)]/10 text-[var(--color-neon-blue)] border border-[var(--color-neon-blue)]/20 font-semibold text-sm hover:bg-[var(--color-neon-blue)]/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer flex items-center justify-center gap-1.5"
             >
               {isApproveSwapLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-              {isApproveSwapSuccess ? '✓ Approved' : 'Approve'}
+              {hasRouterAllowance ? '✓ Router Approved' : 'Step 1: Approve Router'}
             </button>
             <button
               onClick={handleExecuteSwap}
-              disabled={!isApproveSwapSuccess || isSwapLoading || swapOutputEmpty || insufficientBalance}
+              disabled={!hasRouterAllowance || isSwapLoading || swapOutputEmpty || insufficientBalance}
               className="flex-1 py-3 rounded-xl bg-gradient-to-r from-[var(--color-neon-pink)] to-[var(--color-neon-purple)] text-white font-bold text-sm hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer flex items-center justify-center gap-1.5"
             >
               {isSwapLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <span>💣</span>}
-              {isSwapLoading ? 'Swapping...' : 'Execute Swap'}
+              {isSwapLoading ? 'Swapping...' : 'Step 2: Execute Swap'}
             </button>
           </div>
 
@@ -515,6 +704,27 @@ export default function VaultDetailPage() {
             <Zap className="w-5 h-5 text-[var(--color-neon-green)]" />
             Rebalance Events
           </h2>
+
+          {pool?.lastRebalanceFailure && (
+            <div className="p-3 rounded-xl bg-[var(--color-status-danger)]/10 border border-[var(--color-status-danger)]/20 text-sm space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-[var(--color-status-danger)]">
+                  Rebalance failed at tick {pool.lastRebalanceFailure.newTick.toLocaleString()}
+                </span>
+                <span className="text-xs text-[var(--color-text-tertiary)]">
+                  {formatTimestamp(pool.lastRebalanceFailure.timestamp)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-xs text-[var(--color-text-tertiary)] gap-3">
+                <span>{pool.lastRebalanceFailure.reason}</span>
+                {pool.lastRebalanceFailure.txHash && (
+                  <a href={`${EXPLORER_URL}/tx/${pool.lastRebalanceFailure.txHash}`} target="_blank" rel="noreferrer" className="text-[var(--color-neon-blue)] hover:underline flex items-center gap-1 shrink-0">
+                    {formatAddress(pool.lastRebalanceFailure.txHash)} <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
 
           {(!pool?.recentRebalances || pool.recentRebalances.length === 0) ? (
             <div className="text-center py-8 text-[var(--color-text-tertiary)]">
@@ -561,37 +771,108 @@ export default function VaultDetailPage() {
             <span className="text-xs px-2 py-0.5 rounded-full bg-[var(--color-neon-blue)]/10 text-[var(--color-neon-blue)]">Owner</span>
           </h2>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3">
             <button
               onClick={handleStartWatching}
-              disabled={watching || isStartWatchLoading}
+              disabled={primaryWatching || isStartSwapWatchLoading}
+              className="py-3 rounded-xl bg-[var(--color-neon-green)]/10 text-[var(--color-neon-green)] border border-[var(--color-neon-green)]/20 font-semibold text-sm hover:bg-[var(--color-neon-green)]/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer flex items-center justify-center gap-2"
+            >
+              {isStartSwapWatchLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
+              Start Swap Watcher
+            </button>
+            <button
+              onClick={handleStopSwapWatching}
+              disabled={!primaryWatching || isStopSwapWatchLoading}
+              className="py-3 rounded-xl bg-[var(--color-status-danger)]/10 text-[var(--color-status-danger)] border border-[var(--color-status-danger)]/20 font-semibold text-sm hover:bg-[var(--color-status-danger)]/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer flex items-center justify-center gap-2"
+            >
+              {isStopSwapWatchLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <EyeOff className="w-4 h-4" />}
+              Stop Swap Watcher
+            </button>
+            <button
+              onClick={handleStartBackupWatching}
+              disabled={backupWatching || isStartWatchLoading}
               className="py-3 rounded-xl bg-[var(--color-neon-green)]/10 text-[var(--color-neon-green)] border border-[var(--color-neon-green)]/20 font-semibold text-sm hover:bg-[var(--color-neon-green)]/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer flex items-center justify-center gap-2"
             >
               {isStartWatchLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
-              Start Watching (3M gas)
+              Start BlockTick
             </button>
             <button
               onClick={handleStopWatching}
-              disabled={!watching || isStopWatchLoading}
+              disabled={!backupWatching || isStopWatchLoading}
               className="py-3 rounded-xl bg-[var(--color-status-danger)]/10 text-[var(--color-status-danger)] border border-[var(--color-status-danger)]/20 font-semibold text-sm hover:bg-[var(--color-status-danger)]/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer flex items-center justify-center gap-2"
             >
               {isStopWatchLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <EyeOff className="w-4 h-4" />}
-              Stop Watching
+              Stop BlockTick
+            </button>
+            <button
+              onClick={handleManualRebalance}
+              disabled={!initialized || isManualRebalanceLoading}
+              className="py-3 rounded-xl bg-[var(--color-neon-amber)]/10 text-[var(--color-neon-amber)] border border-[var(--color-neon-amber)]/20 font-semibold text-sm hover:bg-[var(--color-neon-amber)]/20 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer flex items-center justify-center gap-2"
+            >
+              {isManualRebalanceLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+              Manual Rebalance
             </button>
           </div>
 
           <div className="grid grid-cols-2 gap-3 text-xs text-[var(--color-text-tertiary)]">
             <div className="glass p-3 rounded-xl">
-              <p>Subscription ID</p>
+              <p>Swap Sub ID</p>
               <p className="font-mono text-[var(--color-text-primary)] mt-0.5">{subscriptionId?.toString() ?? '—'}</p>
             </div>
             <div className="glass p-3 rounded-xl">
-              <p>Backup Sub ID</p>
+              <p>BlockTick Sub ID</p>
               <p className="font-mono text-[var(--color-text-primary)] mt-0.5">{backupSubId?.toString() ?? '—'}</p>
             </div>
           </div>
+
+            {/* Admin Funding Approval */}
+            <div style={{marginTop:'1.5rem',padding:'1rem',background:'rgba(0,200,120,0.08)',border:'1px solid rgba(0,200,120,0.25)',borderRadius:'0.75rem'}}>
+              <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.75rem'}}>
+                <span style={{fontWeight:700,color:'#00c878',fontSize:'0.9rem'}}>Admin Funding Setup</span>
+              </div>
+              <p style={{fontSize:'0.78rem',color:'rgba(255,255,255,0.6)',marginBottom:'0.75rem',lineHeight:1.5}}>
+                Pre-approve both tokens so the vault automatically pulls funds during rebalancing
+                and always creates a balanced two-sided LP position.
+              </p>
+              {hasFundingAddress && (
+                <p style={{fontSize:'0.7rem',color:'rgba(255,255,255,0.4)',marginBottom:'0.5rem'}}>
+                  Funding address: {fundingAddress?.slice(0,10)}...
+                </p>
+              )}
+              {!hasFundingAddress && (
+                <p style={{fontSize:'0.75rem',color:'#f59e0b',marginBottom:'0.75rem'}}>
+                  Admin funding address is not configured yet.
+                </p>
+              )}
+              {hasFundingAddress && !fundingWalletConnected && (
+                <p style={{fontSize:'0.75rem',color:'#f59e0b',marginBottom:'0.75rem'}}>
+                  Switch to the funding wallet to approve these tokens.
+                </p>
+              )}
+              <div style={{display:'flex',gap:'0.75rem',flexWrap:'wrap'}}>
+                <button
+                  onClick={handleApproveFundingToken0}
+                  disabled={!hasFundingAddress || !fundingWalletConnected || isApproved0 || isApproveToken0Loading}
+                  style={{padding:'0.5rem 1rem',fontSize:'0.8rem',borderRadius:'0.5rem',border:'none',cursor:(!hasFundingAddress || !fundingWalletConnected || isApproved0 || isApproveToken0Loading)?'not-allowed':'pointer',opacity:(!hasFundingAddress || !fundingWalletConnected || isApproveToken0Loading)?0.6:1,background:isApproved0?'rgba(0,200,120,0.3)':'rgba(0,200,120,0.15)',color:isApproved0?'#00c878':'rgba(255,255,255,0.8)',fontWeight:600}}
+                >
+                  {isApproved0 ? 'Token0 Approved' : isApproveToken0Loading ? 'Approving Token0...' : 'Approve Token0'}
+                </button>
+                <button
+                  onClick={handleApproveFundingToken1}
+                  disabled={!hasFundingAddress || !fundingWalletConnected || isApproved1 || isApproveToken1Loading}
+                  style={{padding:'0.5rem 1rem',fontSize:'0.8rem',borderRadius:'0.5rem',border:'none',cursor:(!hasFundingAddress || !fundingWalletConnected || isApproved1 || isApproveToken1Loading)?'not-allowed':'pointer',opacity:(!hasFundingAddress || !fundingWalletConnected || isApproveToken1Loading)?0.6:1,background:isApproved1?'rgba(0,200,120,0.3)':'rgba(0,200,120,0.15)',color:isApproved1?'#00c878':'rgba(255,255,255,0.8)',fontWeight:600}}
+                >
+                  {isApproved1 ? 'Token1 Approved' : isApproveToken1Loading ? 'Approving Token1...' : 'Approve Token1'}
+                </button>
+              </div>
+              {isApproved0 && isApproved1 && (
+                <p style={{marginTop:'0.5rem',fontSize:'0.75rem',color:'#00c878'}}>
+                  Vault fully funded — auto-rebalancing is active
+                </p>
+              )}
+            </div>
         </GlassCard>
-      )}
+            )}
     </div>
   )
 }

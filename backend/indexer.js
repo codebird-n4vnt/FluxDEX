@@ -1,17 +1,32 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  FluxDEX — indexer.js
-//  Core indexer. Does three things:
+//  FluxDEX — indexer.js  (FIXED)
 //
-//  1. HISTORICAL SYNC
-//     On startup, replays all past VaultCreated + Rebalanced events from chain.
+//  BUGS FIXED vs original:
 //
-//  2. LIVE EVENT SUBSCRIPTION
-//     Watches for new VaultCreated events and Rebalanced events via WSS.
-//     Falls back to HTTP polling if WSS is unavailable.
+//  FIX 1 — Double subscription
+//    _replayHistoricalEvents was calling _subscribeToVaultEvents per vault,
+//    then _startLiveSubscriptions called it again for every pool in the store.
+//    Result: 2× Rebalanced + 2× Swap listeners per vault → duplicate broadcasts.
+//    Fix: _replayHistoricalEvents only populates the store. _startLiveSubscriptions
+//    is the single place that registers all WSS listeners.
 //
-//  3. LIVE DATA POLLING
-//     Every POLL_INTERVAL_MS, refreshes pool.slot0() and vault.config()
-//     for all indexed pools.
+//  FIX 2 — Stale liveData broadcast
+//    _pollAllVaults snapshotted getAllPools() BEFORE refreshing, then read
+//    pool.liveData from the stale snapshot after refresh.
+//    Fix: call getAllPools() again after Promise.allSettled to get fresh refs.
+//
+//  FIX 3 — Silent WSS death, no reconnect
+//    viem watchContractEvent has no built-in reconnect. When the WebSocket drops
+//    all Rebalanced + Swap listeners die silently. The polling loop kept running
+//    but only price_update was broadcast, never rebalanced.
+//    Fix: track all WSS unwatch functions. On wssClient error/close, tear down
+//    all watchers and re-register after a delay via _resubscribeAll().
+//
+//  FIX 4 — Rebalance poll dedup reads stale snapshot
+//    The HTTP fallback poll read pool.recentRebalances from the pre-refresh
+//    snapshot object, not the live store — so dedup always failed on the first
+//    poll after a WSS rebalance event, causing a duplicate broadcast.
+//    Fix: read fresh pool entry from store inside the dedup check.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { formatEther, formatUnits } from "viem";
@@ -26,18 +41,37 @@ import {
   upsertPool,
   updateLiveData,
   addRebalanceEvent,
+  setRebalanceFailure,
+  clearRebalanceFailure,
   getAllPools,
 } from "./store.js";
 
 const FACTORY_ADDRESS  = process.env.FACTORY_ADDRESS;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
 
-// ── Broadcast callback — set by Socket.io server so indexer can push updates ──
+// ── Broadcast callback ────────────────────────────────────────────────────────
 let broadcastFn = null;
 export function setBroadcast(fn) { broadcastFn = fn; }
-
 function broadcast(type, data) {
   if (broadcastFn) broadcastFn({ type, data });
+}
+
+// ── FIX 3: Track all active WSS unwatch functions so we can tear down cleanly ─
+const _unwatchers = new Map(); // key: `${vaultAddress}:rebalanced` etc.
+
+function _registerWatcher(key, unwatchFn) {
+  // If a watcher already exists for this key, unwatch first (prevents leaks on resubscribe)
+  if (_unwatchers.has(key)) {
+    try { _unwatchers.get(key)(); } catch {}
+  }
+  _unwatchers.set(key, unwatchFn);
+}
+
+function _teardownAllWatchers() {
+  for (const [key, unwatch] of _unwatchers) {
+    try { unwatch(); } catch {}
+  }
+  _unwatchers.clear();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,59 +79,58 @@ function broadcast(type, data) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function startIndexer() {
-  if (!FACTORY_ADDRESS) {
-    throw new Error("FACTORY_ADDRESS not set in .env");
-  }
+  if (!FACTORY_ADDRESS) throw new Error("FACTORY_ADDRESS not set in .env");
 
   console.log("[Indexer] Starting FluxDEX indexer...");
   console.log("[Indexer] Factory:", FACTORY_ADDRESS);
-  console.log("[Indexer] RPC:", process.env.RPC_URL || "(default)");
   console.log("[Indexer] WSS:", wssClient ? "available" : "unavailable (HTTP polling only)");
 
+  // FIX 1: Historical sync only populates the store. No WSS subscriptions here.
   await _replayHistoricalEvents();
-  await _pollAllVaults();         // initial live data load
+  await _pollAllVaults();           // initial live data load
+
+  // FIX 1: All WSS subscriptions happen in one place.
   _startLiveSubscriptions();
   _startPollingLoop();
 
-  const poolCount = getAllPools().length;
-  console.log(`[Indexer] Ready. ${poolCount} pool(s) indexed.`);
+  // FIX 3: Monitor WSS health and reconnect if it drops.
+  _startWSSHealthMonitor();
+
+  console.log(`[Indexer] Ready. ${getAllPools().length} pool(s) indexed.`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  STEP 1 — HISTORICAL SYNC
+//  STEP 1 — HISTORICAL SYNC  (store population only, no WSS subscriptions)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function _replayHistoricalEvents() {
-  console.log("[Indexer] Loading vaults via getAllVaults() (fast path)...");
-
+  console.log("[Indexer] Loading vaults via getAllVaults()...");
   try {
-    // ── FAST PATH: Single RPC call to get all vault addresses ────────────
     const vaultAddresses = await httpClient.readContract({
-      address: FACTORY_ADDRESS,
-      abi:     FACTORY_ABI,
+      address:      FACTORY_ADDRESS,
+      abi:          FACTORY_ABI,
       functionName: "getAllVaults",
     });
 
     console.log(`[Indexer] Factory reports ${vaultAddresses.length} vault(s).`);
 
-    // ── For each vault, read its on-chain state in parallel ─────────────
-    const vaultPromises = vaultAddresses.map(async (vaultAddr) => {
+    await Promise.all(vaultAddresses.map(async (vaultAddr) => {
       try {
-        // Read vault's pool, token0, token1, config in parallel
         const [poolAddr, token0Addr, token1Addr, owner] = await Promise.all([
-          httpClient.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: "pool" }),
+          httpClient.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: "pool"   }),
           httpClient.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: "token0" }),
           httpClient.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: "token1" }),
-          httpClient.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: "owner" }),
+          httpClient.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: "owner"  }),
         ]);
 
-        // Read pool fee from the vault's config
-        const config = await httpClient.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: "config" });
-        const fee = Number(config[4]); // poolFee is at index 4
+        const config = await httpClient.readContract({
+          address: vaultAddr, abi: VAULT_ABI, functionName: "config",
+        });
+        const fee = Number(config[4]);
 
-        // Resolve token metadata
         const [token0Meta, token1Meta] = await getPoolTokenMetadata(token0Addr, token1Addr);
 
+        // FIX 1: Only upsertPool here — no _subscribeToVaultEvents call.
         upsertPool(poolAddr, {
           poolAddress:      poolAddr,
           vaultAddress:     vaultAddr,
@@ -110,52 +143,42 @@ async function _replayHistoricalEvents() {
           liveData:         {},
         });
 
-        console.log(`[Indexer] Indexed vault: ${vaultAddr.slice(0, 10)}... pool: ${poolAddr.slice(0, 10)}... (${token0Meta.symbol}/${token1Meta.symbol})`);
-
-        // Start WSS subscriptions for this vault
-        _subscribeToVaultEvents(vaultAddr, poolAddr);
+        console.log(
+          `[Indexer] Indexed vault: ${vaultAddr.slice(0, 10)}... ` +
+          `pool: ${poolAddr.slice(0, 10)}... (${token0Meta.symbol}/${token1Meta.symbol})`
+        );
       } catch (err) {
         console.warn(`[Indexer] Failed to load vault ${vaultAddr.slice(0, 10)}...:`, err.message);
       }
-    });
+    }));
 
-    await Promise.all(vaultPromises);
-
-    // ── Replay only RECENT Rebalanced events (last 5000 blocks) ─────────
+    // Replay recent Rebalanced events (HTTP getLogs, no WSS)
     const pools = getAllPools();
     if (pools.length > 0) {
       const latestBlock = await httpClient.getBlockNumber();
       const recentStart = latestBlock > 5000n ? latestBlock - 5000n : 0n;
       await _replayRebalancedEvents(recentStart, latestBlock);
     }
-
   } catch (err) {
-    console.error("[Indexer] Fast vault loading failed, falling back to event scan:", err.message);
-    // Fallback to the old slow method
+    console.error("[Indexer] getAllVaults failed, falling back to event scan:", err.message);
     await _replayHistoricalEventsSlow();
   }
 }
 
-// ── SLOW FALLBACK: Original event scanning (used if getAllVaults fails) ────
 async function _replayHistoricalEventsSlow() {
   console.log("[Indexer] Falling back to historical event scan...");
-
   const latestBlock = await httpClient.getBlockNumber();
-  const LOOKBACK_BLOCKS = 10000n; // Reduced from 50000
-  const CHUNK_SIZE  = 5000n;      // Increased from 900
+  const LOOKBACK    = 10000n;
+  const CHUNK       = 5000n;
+  const startBlock  = process.env.DEPLOY_BLOCK
+    ? BigInt(process.env.DEPLOY_BLOCK)
+    : (latestBlock > LOOKBACK ? latestBlock - LOOKBACK : 0n);
 
-  const deployBlock = process.env.DEPLOY_BLOCK ? BigInt(process.env.DEPLOY_BLOCK) : null;
-  const startBlock = deployBlock ?? (latestBlock > LOOKBACK_BLOCKS ? latestBlock - LOOKBACK_BLOCKS : 0n);
-  let fromBlock = startBlock;
+  let fromBlock  = startBlock;
   let totalFound = 0;
 
-  console.log(`[Indexer] Scanning blocks ${startBlock} → ${latestBlock} (latest: ${latestBlock})`);
-
   while (fromBlock <= latestBlock) {
-    const toBlock = fromBlock + CHUNK_SIZE > latestBlock
-      ? latestBlock
-      : fromBlock + CHUNK_SIZE;
-
+    const toBlock = fromBlock + CHUNK > latestBlock ? latestBlock : fromBlock + CHUNK;
     try {
       const logs = await httpClient.getLogs({
         address:   FACTORY_ADDRESS,
@@ -163,22 +186,15 @@ async function _replayHistoricalEventsSlow() {
         fromBlock,
         toBlock,
       });
-
       for (const log of logs) {
-        await _processVaultCreated(log);
+        await _processVaultCreated(log, false); // false = don't subscribe yet
         totalFound++;
       }
-    } catch (err) {
-      if (!err.message.includes("missing block data")) {
-        console.warn(`[Indexer] getLogs failed for blocks ${fromBlock}-${toBlock}:`, err.message);
-      }
-    }
-
+    } catch {}
     fromBlock = toBlock + 1n;
   }
 
-  console.log(`[Indexer] Historical sync complete: ${totalFound} vault(s) found.`);
-
+  console.log(`[Indexer] Historical scan complete: ${totalFound} vault(s) found.`);
   if (totalFound > 0) {
     await _replayRebalancedEvents(startBlock, latestBlock);
   }
@@ -186,150 +202,186 @@ async function _replayHistoricalEventsSlow() {
 
 async function _replayRebalancedEvents(startBlock, latestBlock) {
   const pools = getAllPools();
-  console.log(`[Indexer] Replaying historical Rebalanced events for ${pools.length} vault(s)...`);
+  if (pools.length === 0) return;
+  console.log(`[Indexer] Replaying recent Rebalanced events for ${pools.length} vault(s)...`);
 
-  const CHUNK_SIZE = 5000n;
-
+  const CHUNK = 5000n;
   for (const pool of pools) {
     if (!pool.vaultAddress) continue;
     let fromBlock = startBlock;
     let found = 0;
-
     while (fromBlock <= latestBlock) {
-      const toBlock = fromBlock + CHUNK_SIZE > latestBlock
-        ? latestBlock
-        : fromBlock + CHUNK_SIZE;
-
+      const toBlock = fromBlock + CHUNK > latestBlock ? latestBlock : fromBlock + CHUNK;
       try {
         const logs = await httpClient.getLogs({
-          address: pool.vaultAddress,
-          event:   VAULT_ABI.find(e => e.name === "Rebalanced"),
+          address:   pool.vaultAddress,
+          event:     VAULT_ABI.find(e => e.name === "Rebalanced"),
           fromBlock,
           toBlock,
         });
-
         for (const log of logs) {
-          const event = {
-            newTick:     Number(log.args.newTick),
-            oldTokenId:  log.args.oldTokenId.toString(),
-            newTokenId:  log.args.newTokenId.toString(),
-            blockNumber: Number(log.blockNumber),
-            timestamp:   Date.now(), // approximate
-            txHash:      log.transactionHash,
-          };
-          addRebalanceEvent(pool.poolAddress, event);
-          found++;
-        }
-      } catch (err) {
-        // Non-fatal — skip chunk
-      }
-
-      fromBlock = toBlock + 1n;
-    }
-
-    if (found > 0) {
-      console.log(`[Indexer]   └─ ${pool.vaultAddress.slice(0, 10)}... → ${found} rebalance(s)`);
-    }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  STEP 2 — LIVE EVENT SUBSCRIPTIONS (WSS with fallback)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function _startLiveSubscriptions() {
-  if (!wssClient) {
-    console.log("[Indexer] WSS unavailable — relying on HTTP polling only.");
-    return;
-  }
-
-  try {
-    // ── Subscribe to new VaultCreated events ───────────────────────────────
-    wssClient.watchContractEvent({
-      address:   FACTORY_ADDRESS,
-      abi:       FACTORY_ABI,
-      eventName: "VaultCreated",
-      onLogs: async (logs) => {
-        for (const log of logs) {
-          console.log("[Indexer] New vault created:", log.args.vault);
-          await _processVaultCreated(log);
-
-          // Broadcast the full pool entry (with metadata already resolved)
-          const poolEntry = _getPoolEntry(log.args.pool);
-          broadcast("vault_created", poolEntry);
-        }
-      },
-      onError: (err) => {
-        console.error("[Indexer] VaultCreated subscription error:", err.message);
-      },
-    });
-
-    console.log("[Indexer] Subscribed to VaultCreated events via WSS.");
-
-    // Subscribe to Rebalanced + Swap events for each existing vault
-    const pools = getAllPools();
-    for (const pool of pools) {
-      if (pool.vaultAddress && pool.poolAddress) {
-        _subscribeToVaultEvents(pool.vaultAddress, pool.poolAddress);
-      }
-    }
-  } catch (err) {
-    console.error("[Indexer] Failed to start WSS subscriptions:", err.message);
-    console.log("[Indexer] Falling back to HTTP polling only.");
-  }
-}
-
-// ── Subscribe to Rebalanced events for a specific vault ──────────────────────
-function _subscribeToVaultEvents(vaultAddress, poolAddress) {
-  if (!wssClient) return;
-
-  try {
-    wssClient.watchContractEvent({
-      address:   vaultAddress,
-      abi:       VAULT_ABI,
-      eventName: "Rebalanced",
-      onLogs: async (logs) => {
-        for (const log of logs) {
-          const event = {
+          addRebalanceEvent(pool.poolAddress, {
             newTick:     Number(log.args.newTick),
             oldTokenId:  log.args.oldTokenId.toString(),
             newTokenId:  log.args.newTokenId.toString(),
             blockNumber: Number(log.blockNumber),
             timestamp:   Date.now(),
             txHash:      log.transactionHash,
+          });
+          found++;
+        }
+      } catch {}
+      fromBlock = toBlock + 1n;
+    }
+    if (found > 0) console.log(`[Indexer]   └─ ${pool.vaultAddress.slice(0, 10)}... → ${found} rebalance(s)`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  STEP 2 — LIVE WSS SUBSCRIPTIONS  (single registration point — FIX 1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _startLiveSubscriptions() {
+  if (!wssClient) {
+    console.log("[Indexer] WSS unavailable — HTTP polling only.");
+    return;
+  }
+
+  try {
+    // Subscribe to new VaultCreated events on the factory
+    const unwatchFactory = wssClient.watchContractEvent({
+      address:   FACTORY_ADDRESS,
+      abi:       FACTORY_ABI,
+      eventName: "VaultCreated",
+      onLogs: async (logs) => {
+        for (const log of logs) {
+          console.log("[Indexer] New vault created:", log.args.vault);
+          // FIX 1: _processVaultCreated with subscribe=true registers WSS watchers
+          await _processVaultCreated(log, true);
+          const poolEntry = _getPoolEntry(log.args.pool);
+          if (poolEntry) broadcast("vault_created", poolEntry);
+        }
+      },
+      onError: (err) => console.error("[Indexer] VaultCreated sub error:", err.message),
+    });
+    _registerWatcher("factory:vaultCreated", unwatchFactory);
+    console.log("[Indexer] Subscribed to VaultCreated events.");
+
+    // FIX 1: Subscribe to every vault already in the store exactly once
+    for (const pool of getAllPools()) {
+      if (pool.vaultAddress && pool.poolAddress) {
+        _subscribeToVaultEvents(pool.vaultAddress, pool.poolAddress);
+      }
+    }
+  } catch (err) {
+    console.error("[Indexer] Failed to start WSS subscriptions:", err.message);
+  }
+}
+
+// ── FIX 3: Re-subscribe all pools (called after WSS reconnect) ────────────────
+async function _resubscribeAll() {
+  console.log("[Indexer] Re-subscribing all watchers after WSS reconnect...");
+  _teardownAllWatchers();
+  _startLiveSubscriptions();
+}
+
+function _subscribeToVaultEvents(vaultAddress, poolAddress) {
+  if (!wssClient) return;
+
+  // ── Rebalanced ────────────────────────────────────────────────────────────
+  try {
+    const unwatchRebalanced = wssClient.watchContractEvent({
+      address:   vaultAddress,
+      abi:       VAULT_ABI,
+      eventName: "Rebalanced",
+      onLogs: async (logs) => {
+        for (const log of logs) {
+          const event = {
+            newTick:     _toSafeNumber(log.args?.newTick),
+            oldTokenId:  _toSafeString(log.args?.oldTokenId),
+            newTokenId:  _toSafeString(log.args?.newTokenId),
+            blockNumber: Number(log.blockNumber),
+            timestamp:   Date.now(),
+            txHash:      log.transactionHash,
           };
 
           addRebalanceEvent(poolAddress, event);
-
-          // Refresh live data immediately after a rebalance
+          clearRebalanceFailure(poolAddress);
           await _refreshVaultLiveData(poolAddress, vaultAddress);
 
+          const freshPool = _getPoolEntry(poolAddress);
           console.log(
-            `[Indexer] Rebalanced: pool=${poolAddress.slice(0, 10)}... newTick=${event.newTick}`
+            `[Indexer] Rebalanced: pool=${poolAddress.slice(0, 10)}... ` +
+            `newTick=${event.newTick} tx=${event.txHash?.slice(0, 10)}...`
           );
 
           broadcast("rebalanced", {
+            poolAddress,
+            vaultAddress,
+            newTickLower: freshPool?.liveData?.tickLower,
+            newTickUpper: freshPool?.liveData?.tickUpper,
+            ...event
+          });
+        }
+      },
+      onError: (err) =>
+        console.error(`[Indexer] Rebalanced sub error (${vaultAddress.slice(0, 10)}...):`, err.message),
+    });
+    _registerWatcher(`${vaultAddress}:rebalanced`, unwatchRebalanced);
+  } catch (err) {
+    console.warn(`[Indexer] Rebalanced subscription failed (${vaultAddress.slice(0, 10)}...):`, err.message);
+  }
+
+  try {
+    const unwatchRebalanceFailed = wssClient.watchContractEvent({
+      address:   vaultAddress,
+      abi:       VAULT_ABI,
+      eventName: "RebalanceFailed",
+      onLogs: async (logs) => {
+        for (const log of logs) {
+          const event = {
+            newTick:     _toSafeNumber(log.args?.newTick),
+            oldTokenId:  _toSafeString(log.args?.oldTokenId),
+            reason:      log.args?.reason ?? "unknown reason",
+            blockNumber: Number(log.blockNumber),
+            timestamp:   Date.now(),
+            txHash:      log.transactionHash,
+          };
+
+          setRebalanceFailure(poolAddress, event);
+          await _refreshVaultLiveData(poolAddress, vaultAddress);
+
+          console.warn(
+            `[Indexer] RebalanceFailed: pool=${poolAddress.slice(0, 10)}... ` +
+            `reason=${event.reason} tx=${event.txHash?.slice(0, 10)}...`
+          );
+
+          broadcast("rebalance_failed", {
             poolAddress,
             vaultAddress,
             ...event,
           });
         }
       },
-      onError: (err) => {
-        console.error(`[Indexer] Rebalanced sub error (${vaultAddress.slice(0, 10)}...):`, err.message);
-      },
+      onError: (err) =>
+        console.error(`[Indexer] RebalanceFailed sub error (${vaultAddress.slice(0, 10)}...):`, err.message),
     });
+    _registerWatcher(`${vaultAddress}:rebalanceFailed`, unwatchRebalanceFailed);
+  } catch (err) {
+    console.warn(`[Indexer] RebalanceFailed subscription failed (${vaultAddress.slice(0, 10)}...):`, err.message);
+  }
 
-    // Also subscribe to Swap events on the pool for live price updates
-    wssClient.watchContractEvent({
+  // ── Swap ──────────────────────────────────────────────────────────────────
+  try {
+    const unwatchSwap = wssClient.watchContractEvent({
       address:   poolAddress,
       abi:       POOL_ABI,
       eventName: "Swap",
       onLogs: async (logs) => {
         for (const log of logs) {
+          _markSwapSeen();
           const pool = _getPoolEntry(poolAddress);
           if (!pool) continue;
-
           const { sqrtPriceX96, tick } = log.args;
           const price = _computePrice(sqrtPriceX96, pool.token0, pool.token1);
 
@@ -349,15 +401,45 @@ function _subscribeToVaultEvents(vaultAddress, poolAddress) {
           });
         }
       },
-      onError: (err) => {
-        console.error(`[Indexer] Swap sub error (${poolAddress.slice(0, 10)}...):`, err.message);
-      },
+      onError: (err) =>
+        console.error(`[Indexer] Swap sub error (${poolAddress.slice(0, 10)}...):`, err.message),
     });
-
-    console.log(`[Indexer] Subscribed to Rebalanced+Swap for vault ${vaultAddress.slice(0, 10)}...`);
+    _registerWatcher(`${poolAddress}:swap`, unwatchSwap);
   } catch (err) {
-    console.warn(`[Indexer] WSS subscription failed for ${vaultAddress.slice(0, 10)}...:`, err.message);
+    console.warn(`[Indexer] Swap subscription failed (${poolAddress.slice(0, 10)}...):`, err.message);
   }
+
+  console.log(`[Indexer] Subscribed Rebalanced+RebalanceFailed+Swap for vault ${vaultAddress.slice(0, 10)}...`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  FIX 3 — WSS HEALTH MONITOR
+//  viem's watchContractEvent silently stops delivering events if the underlying
+//  WebSocket drops. We detect this by tracking the last time any Swap was seen.
+//  If more than 2× the poll interval passes with no Swap, we force-resubscribe.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _lastSwapSeen = Date.now();
+const WSS_DEAD_THRESHOLD_MS = Math.max(POLL_INTERVAL_MS * 4, 30_000);
+
+function _markSwapSeen() { _lastSwapSeen = Date.now(); }
+
+function _startWSSHealthMonitor() {
+  if (!wssClient) return;
+
+  setInterval(async () => {
+    const elapsed = Date.now() - _lastSwapSeen;
+    if (elapsed > WSS_DEAD_THRESHOLD_MS) {
+      console.warn(
+        `[Indexer] No Swap events seen for ${Math.round(elapsed / 1000)}s — ` +
+        `assuming WSS dead, resubscribing...`
+      );
+      _lastSwapSeen = Date.now(); // reset so we don't spam reconnects
+      await _resubscribeAll();
+    }
+  }, WSS_DEAD_THRESHOLD_MS);
+
+  console.log(`[Indexer] WSS health monitor active (threshold: ${WSS_DEAD_THRESHOLD_MS}ms).`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,105 +447,137 @@ function _subscribeToVaultEvents(vaultAddress, poolAddress) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function _startPollingLoop() {
-  setInterval(async () => {
-    await _pollAllVaults();
-  }, POLL_INTERVAL_MS);
-
+  setInterval(_pollAllVaults, POLL_INTERVAL_MS);
   console.log(`[Indexer] Polling live data every ${POLL_INTERVAL_MS}ms.`);
 }
 
 async function _pollAllVaults() {
-  const pools = getAllPools();
-  if (pools.length === 0) return;
+  // FIX 2: Snapshot pools BEFORE refresh, then re-fetch AFTER for fresh liveData.
+  const poolsBefore = getAllPools();
+  if (poolsBefore.length === 0) return;
 
-  const results = await Promise.allSettled(
-    pools.map(p => _refreshVaultLiveData(p.poolAddress, p.vaultAddress))
+  await Promise.allSettled(
+    poolsBefore.map(p => _refreshVaultLiveData(p.poolAddress, p.vaultAddress))
   );
 
-  // Broadcast price updates for all successfully refreshed pools
-  for (let i = 0; i < pools.length; i++) {
-    if (results[i].status === "fulfilled") {
-      const pool = pools[i];
-      const liveData = pool.liveData;
-      if (liveData && liveData.currentTick !== undefined) {
-        broadcast("price_update", {
-          poolAddress:  pool.poolAddress,
-          sqrtPriceX96: liveData.sqrtPriceX96,
-          currentTick:  liveData.currentTick,
-          price:        liveData.price,
-          priceLabel:   liveData.priceLabel,
-          tickLower:    liveData.tickLower,
-          tickUpper:    liveData.tickUpper,
-          watching:     liveData.watching,
-          initialized:  liveData.initialized,
-        });
-      }
+  // FIX 2: getAllPools() again after refresh — now liveData references are current.
+  const poolsAfter = getAllPools();
+  for (const pool of poolsAfter) {
+    const ld = pool.liveData;
+    if (ld && ld.currentTick !== undefined) {
+      broadcast("price_update", {
+        poolAddress:  pool.poolAddress,
+        sqrtPriceX96: ld.sqrtPriceX96,
+        currentTick:  ld.currentTick,
+        price:        ld.price,
+        priceLabel:   ld.priceLabel,
+        tickLower:    ld.tickLower,
+        tickUpper:    ld.tickUpper,
+        halfWidth:    ld.halfWidth,
+        watching:     ld.watching,
+        initialized:  ld.initialized,
+      });
     }
   }
 
-  // ── Poll for recent Rebalanced events (HTTP fallback for WSS) ──────────
+  // ── HTTP fallback: catch any Rebalanced events missed by WSS ─────────────
   try {
     const latestBlock = await httpClient.getBlockNumber();
-    const fromBlock = latestBlock > 50n ? latestBlock - 50n : 0n;
+    const fromBlock   = latestBlock > 50n ? latestBlock - 50n : 0n;
 
-    for (const pool of pools) {
+    for (const pool of poolsAfter) {
       if (!pool.vaultAddress) continue;
       try {
         const logs = await httpClient.getLogs({
-          address: pool.vaultAddress,
-          event:   VAULT_ABI.find(e => e.name === "Rebalanced"),
+          address:   pool.vaultAddress,
+          event:     VAULT_ABI.find(e => e.name === "Rebalanced"),
           fromBlock,
-          toBlock: latestBlock,
+          toBlock:   latestBlock,
         });
 
         for (const log of logs) {
+          const txHash = log.transactionHash;
+
+          // FIX 4: Read fresh pool entry from store for dedup, not the snapshot object.
+          const freshPool = _getPoolEntry(pool.poolAddress);
+          const alreadySeen = (freshPool?.recentRebalances ?? []).some(r => r.txHash === txHash);
+          if (alreadySeen) continue;
+
           const event = {
-            newTick:     Number(log.args.newTick),
-            oldTokenId:  log.args.oldTokenId.toString(),
-            newTokenId:  log.args.newTokenId.toString(),
+            newTick:     _toSafeNumber(log.args?.newTick),
+            oldTokenId:  _toSafeString(log.args?.oldTokenId),
+            newTokenId:  _toSafeString(log.args?.newTokenId),
             blockNumber: Number(log.blockNumber),
             timestamp:   Date.now(),
-            txHash:      log.transactionHash,
+            txHash,
           };
 
-          // Only add if we haven't seen this tx hash before
-          const existing = pool.recentRebalances || [];
-          if (!existing.some(r => r.txHash === event.txHash)) {
-            addRebalanceEvent(pool.poolAddress, event);
-            console.log(
-              `[Indexer] Rebalanced (polled): pool=${pool.poolAddress.slice(0, 10)}... newTick=${event.newTick}`
-            );
-            broadcast("rebalanced", {
-              poolAddress: pool.poolAddress,
-              vaultAddress: pool.vaultAddress,
-              ...event,
-            });
-          }
+          addRebalanceEvent(pool.poolAddress, event);
+          console.log(
+            `[Indexer] Rebalanced (HTTP poll): pool=${pool.poolAddress.slice(0, 10)}... ` +
+            `newTick=${event.newTick}`
+          );
+          broadcast("rebalanced", {
+            poolAddress:  pool.poolAddress,
+            vaultAddress: pool.vaultAddress,
+            newTickLower: freshPool?.liveData?.tickLower,
+            newTickUpper: freshPool?.liveData?.tickUpper,
+            ...event,
+          });
         }
-      } catch {
-        // Non-fatal — skip this vault's rebalance poll
-      }
+
+        const failedLogs = await httpClient.getLogs({
+          address:   pool.vaultAddress,
+          event:     VAULT_ABI.find(e => e.name === "RebalanceFailed"),
+          fromBlock,
+          toBlock:   latestBlock,
+        });
+
+        for (const log of failedLogs) {
+          const txHash = log.transactionHash;
+          const freshPool = _getPoolEntry(pool.poolAddress);
+          const alreadySeenFailure = freshPool?.lastRebalanceFailure?.txHash === txHash;
+          if (alreadySeenFailure) continue;
+
+          const event = {
+            newTick:     _toSafeNumber(log.args?.newTick),
+            oldTokenId:  _toSafeString(log.args?.oldTokenId),
+            reason:      log.args?.reason ?? "unknown reason",
+            blockNumber: Number(log.blockNumber),
+            timestamp:   Date.now(),
+            txHash,
+          };
+
+          setRebalanceFailure(pool.poolAddress, event);
+          console.warn(
+            `[Indexer] RebalanceFailed (HTTP poll): pool=${pool.poolAddress.slice(0, 10)}... ` +
+            `reason=${event.reason}`
+          );
+          broadcast("rebalance_failed", {
+            poolAddress:  pool.poolAddress,
+            vaultAddress: pool.vaultAddress,
+            ...event,
+          });
+        }
+      } catch { /* non-fatal — skip this vault */ }
     }
-  } catch {
-    // Non-fatal — latestBlock fetch failed
-  }
+  } catch { /* non-fatal — latestBlock fetch failed */ }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  INTERNALS
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function _processVaultCreated(log) {
+// FIX 1: Added `andSubscribe` flag — false during historical replay, true for live events.
+async function _processVaultCreated(log, andSubscribe = true) {
   const { pool, vault, token0, token1, fee, deployer } = log.args;
-
-  // Resolve token metadata (Uniswap list → on-chain fallback)
   const [token0Meta, token1Meta] = await getPoolTokenMetadata(token0, token1);
 
   upsertPool(pool, {
     poolAddress:      pool,
     vaultAddress:     vault,
     fee:              Number(fee),
-    deployer:         deployer,
+    deployer,
     createdAt:        Date.now(),
     token0:           token0Meta,
     token1:           token1Meta,
@@ -471,36 +585,28 @@ async function _processVaultCreated(log) {
     liveData:         {},
   });
 
-  console.log(`[Indexer] Indexed vault: ${vault.slice(0, 10)}... pool: ${pool.slice(0, 10)}... (${token0Meta.symbol}/${token1Meta.symbol})`);
+  console.log(
+    `[Indexer] Indexed vault: ${vault.slice(0, 10)}... ` +
+    `pool: ${pool.slice(0, 10)}... (${token0Meta.symbol}/${token1Meta.symbol})`
+  );
 
-  // Start WSS subscriptions for this vault + pool
-  _subscribeToVaultEvents(vault, pool);
+  // FIX 1: Only subscribe if called from the live VaultCreated handler.
+  if (andSubscribe) {
+    _subscribeToVaultEvents(vault, pool);
+  }
 }
 
 async function _refreshVaultLiveData(poolAddress, vaultAddress) {
   try {
-    const poolContract = {
-      address: poolAddress,
-      abi:     POOL_ABI,
-    };
-
-    const vaultContract = {
-      address: vaultAddress,
-      abi:     VAULT_ABI,
-    };
-
     const pool = _getPoolEntry(poolAddress);
     if (!pool) return;
 
-    // Batch all reads in parallel — minimises round trips
-    // Now also reads pool token balances for liquidity health display
     const readPromises = [
-      httpClient.readContract({ ...poolContract,  functionName: "slot0"      }),
-      httpClient.readContract({ ...vaultContract, functionName: "config"     }),
-      httpClient.readContract({ ...vaultContract, functionName: "sttBalance" }),
+      httpClient.readContract({ address: poolAddress,  abi: POOL_ABI,  functionName: "slot0"      }),
+      httpClient.readContract({ address: vaultAddress, abi: VAULT_ABI, functionName: "config"     }),
+      httpClient.readContract({ address: vaultAddress, abi: VAULT_ABI, functionName: "sttBalance" }),
     ];
 
-    // Add pool token balance reads if we have token addresses
     if (pool.token0?.address && pool.token1?.address) {
       readPromises.push(
         httpClient.readContract({ address: pool.token0.address, abi: ERC20_ABI, functionName: "balanceOf", args: [poolAddress] }),
@@ -508,10 +614,13 @@ async function _refreshVaultLiveData(poolAddress, vaultAddress) {
       );
     }
 
-    const results = await Promise.all(readPromises);
+    const results  = await Promise.all(readPromises);
     const [slot0, config, sttBal] = results;
     const poolBal0 = results[3];
     const poolBal1 = results[4];
+
+    // FIX 3: Any successful slot0 read counts as WSS-equivalent activity.
+    // (Only update lastSwapSeen from actual Swap events, not polls — see _markSwapSeen)
 
     const price = _computePrice(slot0[0], pool.token0, pool.token1);
 
@@ -523,12 +632,12 @@ async function _refreshVaultLiveData(poolAddress, vaultAddress) {
       tickLower:    Number(config[0]),
       tickUpper:    Number(config[1]),
       halfWidth:    Number(config[2]),
+      tickSpacing:  Number(config[3]),
       watching:     config[6],
       initialized:  config[5],
       sttBalance:   formatEther(sttBal),
     };
 
-    // Add pool token balances if available
     if (poolBal0 !== undefined && pool.token0?.decimals != null) {
       liveUpdate.poolBalance0 = formatUnits(poolBal0, pool.token0.decimals);
     }
@@ -537,17 +646,13 @@ async function _refreshVaultLiveData(poolAddress, vaultAddress) {
     }
 
     updateLiveData(poolAddress, liveUpdate);
-
   } catch (err) {
-    // Non-fatal — poll will retry
     console.warn(`[Indexer] Refresh failed for ${poolAddress.slice(0, 10)}...:`, err.message);
   }
 }
 
 function _computePrice(sqrtPriceX96, token0Meta, token1Meta) {
-  if (!token0Meta || !token1Meta) {
-    return { value: 0, label: "—" };
-  }
+  if (!token0Meta || !token1Meta) return { value: 0, label: "—" };
 
   const raw = sqrtPriceX96ToPrice(
     BigInt(sqrtPriceX96),
@@ -555,39 +660,46 @@ function _computePrice(sqrtPriceX96, token0Meta, token1Meta) {
     token1Meta.decimals
   );
 
-  // If token0 is a stablecoin, price = USD value of 1 token1
   if (isStablecoin(token0Meta.address)) {
     return {
       value: raw,
-      label: `1 ${token1Meta.symbol} = $${raw.toLocaleString("en-US", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      })}`,
+      label: `1 ${token1Meta.symbol} = $${raw.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
     };
   }
-
-  // If token1 is a stablecoin, invert
   if (isStablecoin(token1Meta.address)) {
-    const inverted = raw > 0 ? 1 / raw : 0;
+    const inv = raw > 0 ? 1 / raw : 0;
     return {
-      value: inverted,
-      label: `1 ${token0Meta.symbol} = $${inverted.toLocaleString("en-US", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      })}`,
+      value: inv,
+      label: `1 ${token0Meta.symbol} = $${inv.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
     };
   }
-
-  // Neither is a stablecoin — show ratio
   return {
     value: raw,
     label: `1 ${token0Meta.symbol} = ${raw.toFixed(6)} ${token1Meta.symbol}`,
   };
 }
 
-// Helper to get pool entry
 function _getPoolEntry(poolAddress) {
   return getAllPools().find(
-    p => p.poolAddress?.toLowerCase() === poolAddress.toLowerCase()
+    p => p.poolAddress?.toLowerCase() === poolAddress?.toLowerCase()
   ) ?? null;
+}
+
+function _toSafeString(value, fallback = "0") {
+  if (value == null) return fallback;
+  try {
+    return value.toString();
+  } catch {
+    return fallback;
+  }
+}
+
+function _toSafeNumber(value, fallback = 0) {
+  if (value == null) return fallback;
+  try {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
 }

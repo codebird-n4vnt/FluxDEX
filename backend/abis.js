@@ -70,6 +70,15 @@ export const VAULT_ABI = [
   },
   {
     type: "event",
+    name: "RebalanceFailed",
+    inputs: [
+      { name: "newTick",    type: "int24",   indexed: true  },
+      { name: "oldTokenId", type: "uint256", indexed: false },
+      { name: "reason",     type: "string",  indexed: false },
+    ],
+  },
+  {
+    type: "event",
     name: "WatchingStarted",
     inputs: [{ name: "subscriptionId", type: "uint256", indexed: true }],
   },

@@ -1,7 +1,7 @@
 // src/hooks/usePools.ts
 import { useState, useEffect, useCallback, useRef } from "react";
 import socket from "../lib/socket";
-import type { Pool, LiveData, RebalanceEvent } from "../types";
+import type { Pool, LiveData, RebalanceEvent, RebalanceFailureEvent } from "../types";
 
 const API_BASE = import.meta.env.VITE_BACKEND_URL ?? "http://localhost:3001";
 
@@ -50,7 +50,19 @@ export function usePools() {
       if (!existing) return prev;
       const next = new Map(prev);
       const rebalances = [event, ...(existing.recentRebalances ?? [])].slice(0, 10);
-      next.set(key, { ...existing, recentRebalances: rebalances });
+      next.set(key, { ...existing, recentRebalances: rebalances, lastRebalanceFailure: null });
+      return next;
+    });
+  }, []);
+
+  const setRebalanceFailure = useCallback((poolAddress: string, event: RebalanceFailureEvent) => {
+    const key = poolAddress?.toLowerCase();
+    if (!key) return;
+    setPoolMap((prev) => {
+      const existing = prev.get(key);
+      if (!existing) return prev;
+      const next = new Map(prev);
+      next.set(key, { ...existing, lastRebalanceFailure: event });
       return next;
     });
   }, []);
@@ -77,14 +89,7 @@ export function usePools() {
     const onDisconnect = () => setIsConnected(false);
 
     const onSnapshot = (pools: Pool[]) => {
-      setPoolMap(() => {
-        const next = new Map<string, Pool>();
-        for (const pool of pools) {
-          const key = pool.poolAddress?.toLowerCase();
-          if (key) next.set(key, pool);
-        }
-        return next;
-      });
+      mergePools(pools);
       setIsLoading(false);
       setError(null);
     };
@@ -93,9 +98,16 @@ export function usePools() {
       updateLiveData(poolAddress, liveData);
     };
 
-    const onRebalanced = ({ poolAddress, ...event }: RebalanceEvent & { poolAddress: string }) => {
+    const onRebalanced = ({ poolAddress, newTickLower, newTickUpper, ...event }: RebalanceEvent & { poolAddress: string, newTickLower?: number, newTickUpper?: number }) => {
       addRebalance(poolAddress, { ...event, timestamp: event.timestamp ?? Date.now() });
-      updateLiveData(poolAddress, { currentTick: event.newTick });
+      const updates: Partial<LiveData> = { currentTick: event.newTick };
+      if (newTickLower !== undefined) updates.tickLower = newTickLower;
+      if (newTickUpper !== undefined) updates.tickUpper = newTickUpper;
+      updateLiveData(poolAddress, updates);
+    };
+
+    const onRebalanceFailed = ({ poolAddress, ...event }: RebalanceFailureEvent & { poolAddress: string }) => {
+      setRebalanceFailure(poolAddress, { ...event, timestamp: event.timestamp ?? Date.now() });
     };
 
     const onVaultCreated = (pool: Pool) => {
@@ -107,6 +119,7 @@ export function usePools() {
     socket.on("snapshot", onSnapshot);
     socket.on("price_update", onPriceUpdate);
     socket.on("rebalanced", onRebalanced);
+    socket.on("rebalance_failed", onRebalanceFailed);
     socket.on("vault_created", onVaultCreated);
 
     return () => {
@@ -115,9 +128,10 @@ export function usePools() {
       socket.off("snapshot", onSnapshot);
       socket.off("price_update", onPriceUpdate);
       socket.off("rebalanced", onRebalanced);
+      socket.off("rebalance_failed", onRebalanceFailed);
       socket.off("vault_created", onVaultCreated);
     };
-  }, [fetchPools, mergePools, updateLiveData, addRebalance]);
+  }, [fetchPools, mergePools, updateLiveData, addRebalance, setRebalanceFailure]);
 
   const pools = _sortPools(Array.from(poolMap.values()));
 

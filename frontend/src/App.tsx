@@ -1,5 +1,5 @@
 import { Routes, Route } from 'react-router-dom'
-import Layout from './components/Layout/Layout.tsx'
+import Layout from './components/layout/Layout.tsx'
 import DashboardPage from './pages/DashboardPage.tsx'
 import CreateVaultPage from './pages/CreateVaultPage.tsx'
 import VaultDetailPage from './pages/VaultDetailPage.tsx'

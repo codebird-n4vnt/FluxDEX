@@ -34,7 +34,7 @@ export default function Navbar() {
               <Zap className="w-8 h-8 text-[var(--color-neon-blue)] group-hover:drop-shadow-[0_0_8px_rgba(0,212,255,0.6)] transition-all" />
             </div>
             <span className="text-xl font-bold gradient-text tracking-tight">
-              FluxVault
+              FluxDEX
             </span>
           </Link>
 

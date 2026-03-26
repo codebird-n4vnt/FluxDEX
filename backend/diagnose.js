@@ -1,91 +1,52 @@
-import { createPublicClient, http, formatEther } from 'viem';
+import { createPublicClient, http, parseAbiItem, formatUnits, formatEther } from "viem";
 
+const rpc = "https://dream-rpc.somnia.network";
+const client = createPublicClient({ transport: http(rpc) });
+
+const VAULT = "0x1de0bd7D3Da2Ff24B55B4Cd8Cfde24085c35C40"; // from screenshot
+const BASE  = "0x96Eb871D51C51Af3BdEF5A5bf96a75812f220b68";
+const WETH  = "0x9f38ec3561b2788a8D7F91745AFDF103170c9e90";
+const ADMIN = "0x5DD8F8088eC3aEfd3eAC80C4655FB916856eE361";
+const NPM   = "0x1B95573e9009B7dc15fC147DdB946F35A8BF5aa6";
+
+const ERC20 = [
+  parseAbiItem("function balanceOf(address) view returns (uint256)"),
+  parseAbiItem("function allowance(address,address) view returns (uint256)"),
+];
 const VAULT_ABI = [
-  { type: 'function', name: 'config', inputs: [], outputs: [
-    { name: 'tickLower', type: 'int24' }, { name: 'tickUpper', type: 'int24' },
-    { name: 'halfWidth', type: 'int24' }, { name: 'tickSpacing', type: 'int24' },
-    { name: 'poolFee', type: 'uint24' }, { name: 'initialized', type: 'bool' },
-    { name: 'watching', type: 'bool' },
-  ], stateMutability: 'view' },
-  { type: 'function', name: 'pool', inputs: [], outputs: [{ type: 'address' }], stateMutability: 'view' },
-  { type: 'function', name: 'owner', inputs: [], outputs: [{ type: 'address' }], stateMutability: 'view' },
-  { type: 'function', name: 'tokenId', inputs: [], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
-  { type: 'function', name: 'subscriptionId', inputs: [], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
-  { type: 'function', name: 'backupSubscriptionId', inputs: [], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
-  { type: 'function', name: 'sttBalance', inputs: [], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
-  { type: 'function', name: 'token0', inputs: [], outputs: [{ type: 'address' }], stateMutability: 'view' },
-  { type: 'function', name: 'token1', inputs: [], outputs: [{ type: 'address' }], stateMutability: 'view' },
+  parseAbiItem("function tokenId() view returns (uint256)"),
+  parseAbiItem("function adminFundingAddress() view returns (address)"),
 ];
 
-const POOL_ABI = [
-  { type: 'function', name: 'slot0', inputs: [], outputs: [
-    { name: 'sqrtPriceX96', type: 'uint160' }, { name: 'tick', type: 'int24' },
-    { name: 'observationIndex', type: 'uint16' }, { name: 'observationCardinality', type: 'uint16' },
-    { name: 'observationCardinalityNext', type: 'uint16' }, { name: 'feeProtocol', type: 'uint8' },
-    { name: 'unlocked', type: 'bool' },
-  ], stateMutability: 'view' },
-];
+async function check() {
+  const [
+    vaultBase, vaultWeth,
+    adminBase, adminWeth,
+    adminAllowBase, adminAllowWeth,
+    tokenId, adminAddr
+  ] = await Promise.all([
+    client.readContract({ address: BASE, abi: ERC20, functionName: "balanceOf", args: [VAULT] }),
+    client.readContract({ address: WETH, abi: ERC20, functionName: "balanceOf", args: [VAULT] }),
+    client.readContract({ address: BASE, abi: ERC20, functionName: "balanceOf", args: [ADMIN] }),
+    client.readContract({ address: WETH, abi: ERC20, functionName: "balanceOf", args: [ADMIN] }),
+    client.readContract({ address: BASE, abi: ERC20, functionName: "allowance", args: [ADMIN, VAULT] }),
+    client.readContract({ address: WETH, abi: ERC20, functionName: "allowance", args: [ADMIN, VAULT] }),
+    client.readContract({ address: VAULT, abi: VAULT_ABI, functionName: "tokenId" }),
+    client.readContract({ address: VAULT, abi: VAULT_ABI, functionName: "adminFundingAddress" }),
+  ]);
 
-const FACTORY_ABI = [
-  { type: 'function', name: 'getAllVaults', inputs: [], outputs: [{ name: 'vaults', type: 'address[]' }], stateMutability: 'view' },
-];
-
-const client = createPublicClient({
-  transport: http('https://dream-rpc.somnia.network'),
-});
-
-const FACTORY = '0x3CE6c25CD4a3BB434a31EDDFcd3315cA285B4a49';
-
-async function diagnose() {
-  console.log('═══ FluxDEX Vault Diagnostics ═══\n');
-
-  // Get all vaults
-  const vaults = await client.readContract({ address: FACTORY, abi: FACTORY_ABI, functionName: 'getAllVaults' });
-  console.log(`Factory has ${vaults.length} vault(s):\n`);
-
-  for (const vaultAddr of vaults) {
-    console.log(`── Vault: ${vaultAddr} ──`);
-    
-    const [config, poolAddr, owner, tid, subId, backupSubId, sttBal, t0, t1] = await Promise.all([
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'config' }),
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'pool' }),
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'owner' }),
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'tokenId' }),
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'subscriptionId' }),
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'backupSubscriptionId' }),
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'sttBalance' }),
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'token0' }),
-      client.readContract({ address: vaultAddr, abi: VAULT_ABI, functionName: 'token1' }),
-    ]);
-
-    const nativeBalance = await client.getBalance({ address: vaultAddr });
-    
-    const slot0 = await client.readContract({ address: poolAddr, abi: POOL_ABI, functionName: 'slot0' });
-    const currentTick = Number(slot0[1]);
-
-    console.log(`  Pool:           ${poolAddr}`);
-    console.log(`  Owner:          ${owner}`);
-    console.log(`  Token0:         ${t0}`);
-    console.log(`  Token1:         ${t1}`);
-    console.log(`  TokenID:        ${tid}`);
-    console.log(`  Initialized:    ${config[5]}`);
-    console.log(`  Watching:       ${config[6]}`);
-    console.log(`  SubscriptionID: ${subId}`);
-    console.log(`  BackupSubID:    ${backupSubId}`);
-    console.log(`  STT Balance (sttBalance fn): ${formatEther(sttBal)} STT`);
-    console.log(`  STT Balance (native):        ${formatEther(nativeBalance)} STT`);
-    console.log(`  Tick Range:     [${config[0]}, ${config[1]}]`);
-    console.log(`  Current Tick:   ${currentTick}`);
-    console.log(`  Half Width:     ${config[2]}`);
-    console.log(`  Tick Spacing:   ${config[3]}`);
-    console.log(`  Pool Fee:       ${config[4]}`);
-    
-    const inRange = currentTick >= Number(config[0]) && currentTick < Number(config[1]);
-    console.log(`  ▶ In Range:     ${inRange ? '✅ YES' : '❌ NO — SHOULD REBALANCE'}`);
-    console.log(`  ▶ Has >= 32 STT: ${parseFloat(formatEther(nativeBalance)) >= 32 ? '✅ YES' : '❌ NO — NEEDS FUNDING'}`);
-    console.log(`  ▶ Subscription Active: ${Number(subId) > 0 ? '✅ YES' : '❌ NO — CALL startWatching()'}`);
-    console.log();
-  }
+  console.log("=== VAULT TOKEN BALANCES ===");
+  console.log("Vault BASE:", formatUnits(vaultBase, 18));
+  console.log("Vault WETH:", formatUnits(vaultWeth, 18));
+  console.log("\n=== ADMIN BALANCES ===");
+  console.log("Admin BASE:", formatUnits(adminBase, 18));
+  console.log("Admin WETH:", formatUnits(adminWeth, 18));
+  console.log("\n=== ADMIN → VAULT ALLOWANCES (KEY!) ===");
+  console.log("Admin BASE allowance to vault:", formatUnits(adminAllowBase, 18), adminAllowBase > 0n ? "✅" : "❌ ZERO!");
+  console.log("Admin WETH allowance to vault:", formatUnits(adminAllowWeth, 18), adminAllowWeth > 0n ? "✅" : "❌ ZERO!");
+  console.log("\n=== VAULT STATE ===");
+  console.log("tokenId in storage:", tokenId.toString(), tokenId === 0n ? "⚠️  ZERO (no active position)" : "✅");
+  console.log("adminFundingAddress:", adminAddr, adminAddr !== "0x0000000000000000000000000000000000000000" ? "✅" : "❌ NOT SET");
 }
 
-diagnose().catch(e => console.error('Error:', e.message));
+check().catch(console.error);

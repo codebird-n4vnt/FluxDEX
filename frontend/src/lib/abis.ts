@@ -38,6 +38,9 @@ export const VAULT_ABI = [
   { type: 'function', name: 'token1', inputs: [], outputs: [
     { name: '', type: 'address' },
   ], stateMutability: 'view' },
+  { type: 'function', name: 'adminFundingAddress', inputs: [], outputs: [
+    { name: '', type: 'address' },
+  ], stateMutability: 'view' },
   { type: 'function', name: 'startWatching', inputs: [
     { name: 'gasLimit', type: 'uint64' },
   ], outputs: [], stateMutability: 'nonpayable' },
@@ -46,6 +49,7 @@ export const VAULT_ABI = [
     { name: 'gasLimit', type: 'uint64' },
   ], outputs: [], stateMutability: 'nonpayable' },
   { type: 'function', name: 'stopBackupWatcher', inputs: [], outputs: [], stateMutability: 'nonpayable' },
+  { type: 'function', name: 'manualRebalance', inputs: [], outputs: [], stateMutability: 'nonpayable' },
   { type: 'function', name: 'setHalfWidth', inputs: [
     { name: '_halfWidth', type: 'int24' },
   ], outputs: [], stateMutability: 'nonpayable' },
@@ -53,6 +57,11 @@ export const VAULT_ABI = [
     { name: 'newTick', type: 'int24', indexed: true },
     { name: 'oldTokenId', type: 'uint256', indexed: false },
     { name: 'newTokenId', type: 'uint256', indexed: false },
+  ] },
+  { type: 'event', name: 'RebalanceFailed', inputs: [
+    { name: 'newTick', type: 'int24', indexed: true },
+    { name: 'oldTokenId', type: 'uint256', indexed: false },
+    { name: 'reason', type: 'string', indexed: false },
   ] },
   { type: 'event', name: 'WatchingStarted', inputs: [
     { name: 'subscriptionId', type: 'uint256', indexed: true },

@@ -1,14 +1,29 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract, usePublicClient } from 'wagmi'
-import { parseEther, parseUnits, decodeEventLog } from 'viem'
+import { parseEther, parseUnits, decodeEventLog, getAddress, isAddress } from 'viem'
 import toast from 'react-hot-toast'
 import GlassCard from '../components/ui/GlassCard'
 import { FACTORY_ABI, ERC20_ABI } from '../lib/abis'
 import { ArrowLeft, Coins, Zap, CheckCircle, ExternalLink, Loader2, AlertTriangle } from 'lucide-react'
 
 const FACTORY_ADDRESS = (import.meta.env.VITE_FACTORY_ADDRESS ?? '') as `0x${string}`
+const UNISWAP_V3_FACTORY_ADDRESS = (import.meta.env.VITE_UNISWAP_V3_FACTORY_ADDRESS ?? '0x8Fa7B7147402986451931653fB511D05c9fdaaf8') as `0x${string}`
 const EXPLORER_URL = 'https://shannon-explorer.somnia.network'
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+const UNISWAP_V3_FACTORY_ABI = [
+  {
+    type: 'function',
+    name: 'getPool',
+    inputs: [
+      { name: 'tokenA', type: 'address' },
+      { name: 'tokenB', type: 'address' },
+      { name: 'fee', type: 'uint24' },
+    ],
+    outputs: [{ name: 'pool', type: 'address' }],
+    stateMutability: 'view',
+  },
+] as const
 
 const FEE_TIERS = [
   { value: 500, label: '0.05%', tickSpacing: 10, description: 'Best for stables' },
@@ -66,6 +81,29 @@ export default function CreateVaultPage() {
     query: { enabled: tokenB.length === 42 },
   })
 
+  // On-chain allowance reads — more reliable than ephemeral UI state (resets on refresh)
+  const isAValid = tokenA && isAddress(tokenA)
+  const isBValid = tokenB && isAddress(tokenB)
+  const t0 = isAValid && isBValid ? (tokenA.toLowerCase() < tokenB.toLowerCase() ? getAddress(tokenA) : getAddress(tokenB)) : undefined
+  const t1 = isAValid && isBValid ? (tokenA.toLowerCase() < tokenB.toLowerCase() ? getAddress(tokenB) : getAddress(tokenA)) : undefined
+
+  const { data: factoryAllowance0Raw, refetch: refetchAllow0 } = useReadContract({
+    address: t0,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: address && t0 ? [address, FACTORY_ADDRESS] : undefined,
+    query: { enabled: !!t0 && !!address, refetchInterval: 3000 },
+  })
+  const { data: factoryAllowance1Raw, refetch: refetchAllow1 } = useReadContract({
+    address: t1,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: address && t1 ? [address, FACTORY_ADDRESS] : undefined,
+    query: { enabled: !!t1 && !!address, refetchInterval: 3000 },
+  })
+  const isToken0Approved = factoryAllowance0Raw != null && (factoryAllowance0Raw as bigint) > 0n
+  const isToken1Approved = factoryAllowance1Raw != null && (factoryAllowance1Raw as bigint) > 0n
+
   // Write contract hooks
   const { writeContract: approve0, data: approve0Hash } = useWriteContract()
   const { writeContract: approve1, data: approve1Hash } = useWriteContract()
@@ -90,35 +128,62 @@ export default function CreateVaultPage() {
 
   const handleApprove0 = () => {
     const sorted = getSortedTokens()
+    if (!sorted.token0) return
 
     setStep('approve0')
     approve0({
-      address: sorted.token0 as `0x${string}`,
+      address: getAddress(sorted.token0),
       abi: ERC20_ABI,
       functionName: 'approve',
       // Unlimited approval — standard DeFi pattern (prevents InsufficientAllowance if user changes amounts)
       args: [FACTORY_ADDRESS, BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')],
     }, {
-      onSuccess: () => toast.success(`Token 0 approved ✅`),
+      onSuccess: () => { toast.success(`Approve transaction submitted`); },
       onError: (err) => { toast.error(`Approval failed: ${err.message.slice(0, 80)}`); setStep('form') },
     })
   }
 
   const handleApprove1 = () => {
     const sorted = getSortedTokens()
+    if (!sorted.token1) return
 
     setStep('approve1')
     approve1({
-      address: sorted.token1 as `0x${string}`,
+      address: getAddress(sorted.token1),
       abi: ERC20_ABI,
       functionName: 'approve',
       // Unlimited approval — standard DeFi pattern
       args: [FACTORY_ADDRESS, BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')],
     }, {
-      onSuccess: () => toast.success(`Token 1 approved ✅`),
+      onSuccess: () => { toast.success(`Approve transaction submitted`); },
       onError: (err) => { toast.error(`Approval failed: ${err.message.slice(0, 80)}`); setStep('form') },
     })
   }
+
+  // React to successful receipts
+  useEffect(() => {
+    if (isApprove0Success) {
+      toast.success('Token 0 approved on-chain ✅')
+      refetchAllow0()
+    }
+  }, [isApprove0Success, refetchAllow0])
+
+  useEffect(() => {
+    if (isApprove1Success) {
+      toast.success('Token 1 approved on-chain ✅')
+      refetchAllow1()
+    }
+  }, [isApprove1Success, refetchAllow1])
+
+  // CRITICAL FIX: Reset step + refetch allowances when user changes token addresses.
+  // This prevents the "already approved" glitch when switching to a new token pair
+  // that was never approved, but old allowance data was cached from a different pair.
+  useEffect(() => {
+    setStep('form')
+    refetchAllow0()
+    refetchAllow1()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokenA, tokenB])
 
   const handleCreateVault = async () => {
     const sorted = getSortedTokens()
@@ -126,6 +191,37 @@ export default function CreateVaultPage() {
     const dec1 = sorted.token1.toLowerCase() === tokenB.toLowerCase() ? (token1Decimals ?? 18) : (token0Decimals ?? 18)
 
     // ── Compute sqrtPriceX96 ON-CHAIN (proven to work in simulation) ─────
+    try {
+      const existingPool = await publicClient!.readContract({
+        address: UNISWAP_V3_FACTORY_ADDRESS,
+        abi: UNISWAP_V3_FACTORY_ABI,
+        functionName: 'getPool',
+        args: [sorted.token0 as `0x${string}`, sorted.token1 as `0x${string}`, feeTier],
+      }) as `0x${string}`
+
+      if (existingPool && existingPool.toLowerCase() !== ZERO_ADDRESS) {
+        const existingVault = await publicClient!.readContract({
+          address: FACTORY_ADDRESS,
+          abi: FACTORY_ABI,
+          functionName: 'vaultByPool',
+          args: [existingPool],
+        }) as `0x${string}`
+
+        if (existingVault && existingVault.toLowerCase() !== ZERO_ADDRESS) {
+          toast.error('A vault already exists for this pair + fee tier in the current factory.')
+          return
+        }
+
+        toast.error(
+          'This pair + fee tier already has an initialized Uniswap pool from an older deployment. Use a fresh pair or unused fee tier so you do not inherit stale pool state.',
+          { duration: 9000 }
+        )
+        return
+      }
+    } catch (poolCheckError) {
+      console.warn('[CreateVault] Existing-pool check skipped:', poolCheckError)
+    }
+
     let sqrtPriceX96: bigint
     const price = parseFloat(priceRatio)
     if (price <= 0 || isNaN(price)) {
@@ -134,7 +230,10 @@ export default function CreateVaultPage() {
     }
     const effectivePrice = sorted.invertPrice ? (1 / price) : price
     const PRECISION = 10n ** 18n
-    const numerator = BigInt(Math.round(effectivePrice * 1e18))
+    const effectivePriceString = effectivePrice.toFixed(18)
+    const humanPriceScaled = parseUnits(effectivePriceString, 18)
+    const numerator = humanPriceScaled * (10n ** BigInt(dec1))
+    const denominator = PRECISION * (10n ** BigInt(dec0))
 
     try {
       // Use the factory's on-chain helper — exact Solidity integer math
@@ -142,13 +241,14 @@ export default function CreateVaultPage() {
         address: FACTORY_ADDRESS,
         abi: FACTORY_ABI,
         functionName: 'computeSqrtPriceX96',
-        args: [numerator, PRECISION],
+        args: [numerator, denominator],
       })
       sqrtPriceX96 = result as bigint
       console.log('[CreateVault] On-chain sqrtPriceX96:', sqrtPriceX96.toString())
     } catch (e) {
       // Fallback: JS computation if RPC fails
-      const sqrtPrice = Math.sqrt(effectivePrice)
+      const rawPrice = Number(numerator) / Number(denominator)
+      const sqrtPrice = Math.sqrt(rawPrice)
       const Q96 = '79228162514264337593543950336'
       sqrtPriceX96 = BigInt(Math.round(sqrtPrice * 1e15)) * BigInt(Q96) / (10n ** 15n)
       console.log('[CreateVault] Fallback sqrtPriceX96:', sqrtPriceX96.toString())
@@ -175,7 +275,30 @@ export default function CreateVaultPage() {
       halfWidth: hwInt,
       sttValue: sttAmount,
       invertPrice: sorted.invertPrice,
+      dec0,
+      dec1,
+      rawNumerator: numerator.toString(),
+      rawDenominator: denominator.toString(),
     })
+
+    // ── Amount / price ratio mismatch check (prevents the 'T' revert) ────
+    // Uniswap V3 mint() requires amounts proportional to the price curve.
+    // If they're wildly off, it will revert with 'T' (TransferFailed).
+    const amount0f = parseFloat(sorted.amount0)
+    const amount1f = parseFloat(sorted.amount1)
+    if (amount0f > 0 && amount1f > 0 && effectivePrice > 0) {
+      const impliedRatio = amount1f / amount0f
+      const factor = impliedRatio / effectivePrice
+      if (factor > 50 || factor < 0.02) {
+        toast.error(
+          `⚠️ Amounts and price ratio are mismatched! ` +
+          `Your price ratio is ${effectivePrice.toFixed(4)}, but your amounts imply ${impliedRatio.toFixed(4)}. ` +
+          `If price ratio is ${effectivePrice.toFixed(2)}, deposit 100 of one token and ~${(100 * effectivePrice).toFixed(2)} of the other.`,
+          { duration: 8000 }
+        )
+        return
+      }
+    }
 
     // ── Pre-flight simulation to catch reverts before MetaMask ────────────
     try {
@@ -200,13 +323,21 @@ export default function CreateVaultPage() {
       console.error('[CreateVault] ❌ Pre-flight simulation FAILED:', simError)
       const msg = simError?.message || ''
       if (msg.includes('InsufficientAllowance')) {
-        toast.error('Insufficient token allowance — re-approve both tokens with correct amounts')
+        toast.error('Insufficient token allowance — re-approve both tokens')
       } else if (msg.includes('VaultAlreadyExists')) {
         toast.error('A vault already exists for this token pair + fee tier!')
       } else if (msg.includes('InsufficientSTTFunding')) {
         toast.error('Need at least 32 STT — increase the STT amount')
       } else if (msg.includes('TokenTransferFailed')) {
         toast.error('Token transfer failed — check your token balances')
+      } else if (/reason:\s*T[^A-Za-z]|"T"|reason: T$/m.test(msg)) {
+        // Uniswap V3 'T' = TransferFailed — amounts don't fit the price curve
+        toast.error(
+          '🚨 Deposit amounts don\'t match the price ratio! ' +
+          'Example: if price ratio is 2 (1 TokenA = 2 TokenB), deposit 50 TokenA + 100 TokenB. ' +
+          'The amounts must reflect the actual market price.',
+          { duration: 8000 }
+        )
       } else {
         toast.error(`Simulation failed: ${msg.slice(0, 150)}`)
       }
@@ -499,8 +630,8 @@ export default function CreateVaultPage() {
             <div className="flex items-center gap-2 text-xs">
               {(['approve0', 'approve1', 'create'] as const).map((s, i) => {
                 const labels = ['Approve Token 0', 'Approve Token 1', 'Create Vault']
-                const isDone = (s === 'approve0' && isApprove0Success) ||
-                  (s === 'approve1' && isApprove1Success) ||
+                const isDone = (s === 'approve0' && isToken0Approved) ||
+                  (s === 'approve1' && isToken1Approved) ||
                   (s === 'create' && isCreateSuccess)
                 const isCurrent = step === s
                 return (
@@ -525,36 +656,36 @@ export default function CreateVaultPage() {
               {/* Approve Token 0 */}
               <button
                 onClick={handleApprove0}
-                disabled={!isConnected || !isFormValid || isApprove0Loading || isApprove0Success}
+                disabled={!isConnected || !isFormValid || isApprove0Loading || isToken0Approved}
                 className={`flex-1 py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer ${
-                  isApprove0Success
+                  isToken0Approved
                     ? 'bg-[var(--color-neon-green)]/10 text-[var(--color-neon-green)] border border-[var(--color-neon-green)]/20'
                     : 'bg-[var(--color-neon-blue)]/10 text-[var(--color-neon-blue)] border border-[var(--color-neon-blue)]/20 hover:bg-[var(--color-neon-blue)]/20 disabled:opacity-40 disabled:cursor-not-allowed'
                 }`}
               >
-                {isApprove0Loading ? <Loader2 className="w-4 h-4 animate-spin" /> : isApprove0Success ? <CheckCircle className="w-4 h-4" /> : <Coins className="w-4 h-4" />}
-                {isApprove0Success ? 'Approved' : isApprove0Loading ? 'Confirming...' : 'Approve 0'}
+                {isApprove0Loading ? <Loader2 className="w-4 h-4 animate-spin" /> : isToken0Approved ? <CheckCircle className="w-4 h-4" /> : <Coins className="w-4 h-4" />}
+                {isToken0Approved ? 'Approved' : isApprove0Loading ? 'Confirming...' : 'Approve 0'}
               </button>
 
               {/* Approve Token 1 */}
               <button
                 onClick={handleApprove1}
-                disabled={!isConnected || !isFormValid || !isApprove0Success || isApprove1Loading || isApprove1Success}
+                disabled={!isConnected || !isFormValid || !isToken0Approved || isApprove1Loading || isToken1Approved}
                 className={`flex-1 py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer ${
-                  isApprove1Success
+                  isToken1Approved
                     ? 'bg-[var(--color-neon-green)]/10 text-[var(--color-neon-green)] border border-[var(--color-neon-green)]/20'
                     : 'bg-[var(--color-neon-blue)]/10 text-[var(--color-neon-blue)] border border-[var(--color-neon-blue)]/20 hover:bg-[var(--color-neon-blue)]/20 disabled:opacity-40 disabled:cursor-not-allowed'
                 }`}
               >
-                {isApprove1Loading ? <Loader2 className="w-4 h-4 animate-spin" /> : isApprove1Success ? <CheckCircle className="w-4 h-4" /> : <Coins className="w-4 h-4" />}
-                {isApprove1Success ? 'Approved' : isApprove1Loading ? 'Confirming...' : 'Approve 1'}
+                {isApprove1Loading ? <Loader2 className="w-4 h-4 animate-spin" /> : isToken1Approved ? <CheckCircle className="w-4 h-4" /> : <Coins className="w-4 h-4" />}
+                {isToken1Approved ? 'Approved' : isApprove1Loading ? 'Confirming...' : 'Approve 1'}
               </button>
             </div>
 
             {/* Create Vault */}
             <button
               onClick={handleCreateVault}
-              disabled={!isConnected || !isFormValid || !isApprove0Success || !isApprove1Success || isCreateLoading}
+              disabled={!isConnected || !isFormValid || !isToken0Approved || !isToken1Approved || isCreateLoading}
               className="w-full py-4 rounded-xl bg-gradient-to-r from-[var(--color-neon-blue)] to-[var(--color-neon-purple)] text-white font-bold text-base flex items-center justify-center gap-2 hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
             >
               {isCreateLoading ? (

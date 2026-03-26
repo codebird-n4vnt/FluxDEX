@@ -4,7 +4,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { io, Socket } from "socket.io-client";
-import type { Pool, LiveData, RebalanceEvent } from "../types";
+import type { Pool, LiveData, RebalanceEvent, RebalanceFailureEvent } from "../types";
 
 // ── Strict Event Typing ───────────────────────────────────────────────────────
 // This gives your IDE perfect intellisense anywhere you call socket.on()
@@ -14,6 +14,7 @@ export interface ServerToClientEvents {
   vault_created: (pool: Pool) => void;
   price_update: (data: LiveData & { poolAddress: string }) => void;
   rebalanced: (data: RebalanceEvent & { poolAddress: string }) => void;
+  rebalance_failed: (data: RebalanceFailureEvent & { poolAddress: string }) => void;
 }
 
 export interface ClientToServerEvents {

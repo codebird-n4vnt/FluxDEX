@@ -85,7 +85,7 @@ async function main() {
   const SQRT_PRICE_1_TO_1 = BigInt("79228162514264337593543950336");
 
   // Vault needs >= 32 STT for reactivity subscriptions. We send 80 STT.
-  const STT_FOR_VAULT = ethers.parseEther("80");
+  const STT_FOR_VAULT = ethers.parseEther("40");
 
   // Approve both tokens generously (order doesn't matter because amounts are equal).
   await (await weth.approve(fluxFactoryAddress, DEPOSIT)).wait();
@@ -123,8 +123,8 @@ async function main() {
   const FluxVault = await ethers.getContractFactory("FluxVault");
   const vault = await FluxVault.attach(vaultAddr);
 
-  const GAS_SWAP_HANDLER = 3000000;
-  const GAS_BACKUP_HANDLER = 2000000;
+  const GAS_SWAP_HANDLER = 6000000;
+  const GAS_BACKUP_HANDLER = 6000000;
 
   console.log("Starting vault reactivity subscriptions...");
   await (await vault.startWatching(GAS_SWAP_HANDLER, feeOverrides)).wait();
